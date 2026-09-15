@@ -31,4 +31,12 @@ pnpm-lock.yaml
 src/wasm/
 src-wasm/target/
 
+# Nix
+result
+result-*
+.direnv/
+
+# Test samples
+test_pictures/
+
 stats.html

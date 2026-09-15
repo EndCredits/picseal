@@ -1,4 +1,5 @@
 import type { ExifData, ExifParamsForm } from '../types'
+import domtoimage from 'dom-to-image'
 import moment from 'moment'
 import { BrandsList } from './BrandUtils'
 
@@ -156,4 +157,63 @@ export function dataURLtoBlob(dataURL: string): Blob {
     ia[i] = byteString.charCodeAt(i)
   }
   return new Blob([ab], { type: mimeString })
+}
+
+export interface RasterizeOptions {
+  format: 'jpeg' | 'png'
+  width: number
+  height: number
+  quality?: number
+  style?: Partial<CSSStyleDeclaration>
+}
+
+// 创建导出画布：优先 Display P3 广色域，不支持时回退 sRGB（如 Firefox）
+function createExportCanvas(width: number, height: number): HTMLCanvasElement {
+  let canvas: HTMLCanvasElement | null = null
+  try {
+    const c = document.createElement('canvas')
+    c.width = width
+    c.height = height
+    const ctx = c.getContext('2d', { colorSpace: 'display-p3' })
+    if (ctx && ctx.getContextAttributes()?.colorSpace === 'display-p3')
+      canvas = c
+  }
+  catch {
+    canvas = null
+  }
+  if (!canvas) {
+    canvas = document.createElement('canvas')
+    canvas.width = width
+    canvas.height = height
+  }
+  return canvas
+}
+
+function loadImage(uri: string): Promise<HTMLImageElement> {
+  return new Promise((resolve, reject) => {
+    const image = new Image()
+    image.onload = () => resolve(image)
+    image.onerror = reject
+    image.src = uri
+  })
+}
+
+function delay(ms: number): Promise<void> {
+  return new Promise(resolve => setTimeout(resolve, ms))
+}
+
+// 将 DOM 节点光栅化为 dataURL，等效替换 dom-to-image 的 toPng/toJpeg，
+// 区别是画布使用 Display P3（保留广色域，导出文件自动携带 P3 ICC）
+export async function rasterizeDomToDataUrl(node: HTMLElement, options: RasterizeOptions): Promise<string> {
+  const svgUrl = await domtoimage.toSvg(node, options)
+  const image = await loadImage(svgUrl)
+  await delay(100)
+  const canvas = createExportCanvas(options.width, options.height)
+  const ctx = canvas.getContext('2d')
+  if (!ctx)
+    throw new Error('Failed to get 2d context')
+  ctx.drawImage(image, 0, 0)
+  if (options.format === 'png')
+    return canvas.toDataURL()
+  return canvas.toDataURL('image/jpeg', options.quality ?? 1.0)
 }

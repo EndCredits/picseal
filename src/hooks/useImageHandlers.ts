@@ -2,10 +2,9 @@ import type { RcFile } from 'antd/es/upload'
 
 import type { ExifParamsForm } from '../types'
 import { message } from 'antd'
-import domtoimage from 'dom-to-image'
 import { useRef, useState } from 'react'
 import { getBrandUrl } from '../utils/BrandUtils'
-import { dataURLtoBlob, getRandomImage, parseExifData } from '../utils/ImageUtils'
+import { dataURLtoBlob, getRandomImage, parseExifData, rasterizeDomToDataUrl } from '../utils/ImageUtils'
 import { embedExifRaw, extractExifRaw } from '../utils/JpegExifUtils'
 import { get_exif } from '../wasm/gen_brand_photo_pictrue'
 
@@ -52,23 +51,18 @@ export function useImageHandlers(formRef: any, initialFormValue: ExifParamsForm)
     const zoomRatio = 4
 
     try {
+      const rasterOptions = {
+        width: previewDom.clientWidth * zoomRatio,
+        height: previewDom.clientHeight * zoomRatio,
+        style: { transform: `scale(${zoomRatio})`, transformOrigin: 'top left' },
+      }
       let dataUrl: string
       if (uploadImgType === 'image/png') {
         console.log('dom to png')
-        dataUrl = await domtoimage.toPng(previewDom, {
-          quality: 1.0,
-          width: previewDom.clientWidth * zoomRatio,
-          height: previewDom.clientHeight * zoomRatio,
-          style: { transform: `scale(${zoomRatio})`, transformOrigin: 'top left' },
-        })
+        dataUrl = await rasterizeDomToDataUrl(previewDom, { ...rasterOptions, format: 'png' })
       }
       else {
-        dataUrl = await domtoimage.toJpeg(previewDom, {
-          quality: 1.0,
-          width: previewDom.clientWidth * zoomRatio,
-          height: previewDom.clientHeight * zoomRatio,
-          style: { transform: `scale(${zoomRatio})`, transformOrigin: 'top left' },
-        })
+        dataUrl = await rasterizeDomToDataUrl(previewDom, { ...rasterOptions, format: 'jpeg', quality: 1.0 })
       }
 
       const link = document.createElement('a')
