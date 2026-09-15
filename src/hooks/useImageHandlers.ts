@@ -13,14 +13,36 @@ export function useImageHandlers(formRef: any, initialFormValue: ExifParamsForm)
   const [imgUrl, setImgUrl] = useState<string>(getRandomImage())
   const imgRef = useRef<HTMLImageElement>(null)
   const [uploadImgType, setUploadImgType] = useState<string>()
-  const [exifBlob, setExifBlob] = useState<Blob>(null)
+  const [exifBlob, setExifBlob] = useState<Blob | null>(null)
+
+  // 探测浏览器能否解码该图片（Chrome/Firefox 不支持 HEIC）
+  async function canDecode(blobUrl: string): Promise<boolean> {
+    try {
+      const probe = new Image()
+      probe.src = blobUrl
+      await probe.decode()
+      return true
+    }
+    catch {
+      return false
+    }
+  }
 
   // 处理文件上传
   const handleAdd = (file: RcFile): false => {
-    const reader = new FileReader()
-    reader.onloadend = async (e) => {
+    const load = async () => {
+      const blobUrl = URL.createObjectURL(file)
+      if (!await canDecode(blobUrl)) {
+        URL.revokeObjectURL(blobUrl)
+        const isHeic = /heic|heif/i.test(file.type)
+        message.warning(isHeic
+          ? '当前浏览器不支持 HEIC，请使用 Safari 打开，或先转换为 JPEG/PNG 再上传'
+          : '当前浏览器无法解码该图片格式，请换一张照片', 300)
+        return
+      }
+
       try {
-        const exifData = get_exif(new Uint8Array(e.target.result))
+        const exifData = get_exif(new Uint8Array(await file.arrayBuffer()))
         const parsedExif = parseExifData(exifData)
         const updatedFormValue = {
           ...formValue,
@@ -31,17 +53,22 @@ export function useImageHandlers(formRef: any, initialFormValue: ExifParamsForm)
         console.log('parsed EXIF data: ', parsedExif)
         formRef.current.setFieldsValue(updatedFormValue)
         setFormValue(updatedFormValue)
-        setImgUrl(URL.createObjectURL(new Blob([file], { type: file.type })))
-        const parsedExifBlob = await extractExifRaw(new Blob([file]))
-        setExifBlob(parsedExifBlob)
+        setImgUrl(blobUrl)
         setUploadImgType(file.type)
+        try {
+          setExifBlob(await extractExifRaw(new Blob([file])))
+        }
+        catch {
+          // 非 JPEG 输入没有可回嵌的 APP1 段，忽略
+          setExifBlob(null)
+        }
       }
       catch (error) {
         console.error('Error parsing EXIF data:', error)
         message.error('无法识别照片特定数据，请换一张照片', 300)
       }
     }
-    reader.readAsArrayBuffer(file)
+    load()
     return false
   }
 
