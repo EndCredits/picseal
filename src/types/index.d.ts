@@ -9,6 +9,11 @@ interface ExifData {
   value_with_unit: string
 }
 
+interface HdrInfo {
+  is_hdr: boolean
+  kind: string
+}
+
 export interface ExifParamsForm {
   model: string
   date: string

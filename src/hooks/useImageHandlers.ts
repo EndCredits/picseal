@@ -6,7 +6,7 @@ import { useRef, useState } from 'react'
 import { getBrandUrl } from '../utils/BrandUtils'
 import { dataURLtoBlob, getRandomImage, parseExifData, rasterizeDomToDataUrl } from '../utils/ImageUtils'
 import { embedExifRaw, extractExifRaw } from '../utils/JpegExifUtils'
-import { get_exif } from '../wasm/gen_brand_photo_pictrue'
+import { detect_hdr, get_exif } from '../wasm/gen_brand_photo_pictrue'
 
 export function useImageHandlers(formRef: any, initialFormValue: ExifParamsForm) {
   const [formValue, setFormValue] = useState<ExifParamsForm>(initialFormValue)
@@ -31,18 +31,28 @@ export function useImageHandlers(formRef: any, initialFormValue: ExifParamsForm)
   // 处理文件上传
   const handleAdd = (file: RcFile): false => {
     const load = async () => {
-      const blobUrl = URL.createObjectURL(file)
-      if (!await canDecode(blobUrl)) {
-        URL.revokeObjectURL(blobUrl)
-        const isHeic = /heic|heif/i.test(file.type)
-        message.warning(isHeic
-          ? '当前浏览器不支持 HEIC，请使用 Safari 打开，或先转换为 JPEG/PNG 再上传'
-          : '当前浏览器无法解码该图片格式，请换一张照片', 300)
-        return
-      }
-
       try {
-        const exifData = get_exif(new Uint8Array(await file.arrayBuffer()))
+        const bytes = new Uint8Array(await file.arrayBuffer())
+        const hdrInfo = detect_hdr(bytes) as HdrInfo
+        if (hdrInfo?.is_hdr)
+          console.log('HDR input detected: ', hdrInfo.kind)
+
+        const blobUrl = URL.createObjectURL(file)
+        if (!await canDecode(blobUrl)) {
+          URL.revokeObjectURL(blobUrl)
+          if (hdrInfo?.is_hdr)
+            message.warning('当前浏览器无法解码该 HDR 图片，请使用 Safari 打开，或先转换为 SDR 的 JPEG/PNG 再上传', 300)
+          else if (/heic|heif/i.test(file.type))
+            message.warning('当前浏览器不支持 HEIC，请使用 Safari 打开，或先转换为 JPEG/PNG 再上传', 300)
+          else
+            message.warning('当前浏览器无法解码该图片格式，请换一张照片', 300)
+          return
+        }
+
+        if (hdrInfo?.is_hdr)
+          message.warning('检测到 HDR 照片：导出后将丢失 HDR 信息，输出为 SDR', 300)
+
+        const exifData = get_exif(bytes)
         const parsedExif = parseExifData(exifData)
         const updatedFormValue = {
           ...formValue,
@@ -108,7 +118,8 @@ export function useImageHandlers(formRef: any, initialFormValue: ExifParamsForm)
       else {
         link.href = dataUrl
       }
-      const fileExt: string = (uploadImgType || 'jpg').replace(/image\//g, '')
+      // 扩展名跟随实际输出格式（PNG 输入输出 PNG，其余输出 JPEG）
+      const fileExt = uploadImgType === 'image/png' ? 'png' : 'jpg'
       link.download = `${Date.now()}.${fileExt}`
       document.body.appendChild(link)
       link.click()
