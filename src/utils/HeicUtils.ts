@@ -1,5 +1,5 @@
 // 非 WebKit 浏览器（Chrome/Firefox）的 HEIC 解码回退：
-// 按需动态 import public/ 下的 libheif-js 预打包 ESM（wasm 内联，约 1.9MB），
+// 按需动态 import libheif-js 预打包 ESM（wasm 内联，约 1.9MB，Vite 打成懒加载 chunk），
 // 解码为 SDR RGBA → JPEG Blob 供预览/导出。HDR 不保留（HEVC 重编码不可行）。
 
 export interface HeicDecodeResult {
@@ -9,32 +9,10 @@ export interface HeicDecodeResult {
   ms: number
 }
 
-interface HeifImage {
-  get_width: () => number
-  get_height: () => number
-  display: (
-    target: { data: Uint8ClampedArray, width: number, height: number },
-    callback: (data: unknown | null) => void,
-  ) => void
-  free: () => void
-}
-
-interface LibHeifModule {
-  HeifDecoder: new () => { decode: (data: Uint8Array) => HeifImage[] }
-}
-
-type LibHeifFactory = (overrides?: Record<string, unknown>) => Promise<LibHeifModule>
-
-// 经参数传入的 URL 无法被 Rollup 常量折叠，保证该 import 不进入打包分析
-function importModule<T>(url: string): Promise<T> {
-  return import(/* @vite-ignore */ url) as Promise<T>
-}
-
 export async function decodeHeicToJpeg(file: Blob, quality = 0.95): Promise<HeicDecodeResult | null> {
   try {
     const t0 = performance.now()
-    const url = `${import.meta.env.BASE_URL}libheif/libheif-bundle.js`
-    const { default: createLibHeif } = await importModule<{ default: LibHeifFactory }>(url)
+    const { default: createLibHeif } = await import('libheif-js/libheif-wasm/libheif-bundle.mjs')
     const libheif = await createLibHeif()
     const decoder = new libheif.HeifDecoder()
     const images = decoder.decode(new Uint8Array(await file.arrayBuffer()))

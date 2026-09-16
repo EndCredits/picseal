@@ -12,7 +12,7 @@ export default defineConfig({
     VitePWA({
       workbox: {
         // libheif（HEIC 回退解码，~1.9MB）按需加载，不进预缓存
-        globIgnores: ['**/libheif/**'],
+        globIgnores: ['**/libheif-bundle-*.js'],
       },
     }),
     visualizer({ open: false }),

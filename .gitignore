@@ -31,9 +31,6 @@ pnpm-lock.yaml
 src/wasm/
 src-wasm/target/
 
-# Libheif bundle (copied from node_modules by scripts/build-wasm.js)
-public/libheif/
-
 # Nix
 result
 result-*
