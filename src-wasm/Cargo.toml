@@ -11,19 +11,17 @@ crate-type = [
 ]
 
 [features]
-default = [
-  "console_error_panic_hook",
-  "wee_alloc"
-]
+default = [ "console_error_panic_hook", ]
 
 [dependencies]
 wasm-bindgen = { version = "0.2.81", features = [ "serde-serialize" ] }
 gloo-utils = "0.2"
 console_error_panic_hook = { version = "0.1.7", optional = true }
-wee_alloc = { version = "0.4.5", optional = true }
 kamadak-exif = "0.5.4"
 serde = { version = "1.0.138", features = [ "derive" ] }
 serde_json = "1.0.133"
+png = "0.18.1"
+crc32fast = "1.5.2"
 
 [profile.release]
 opt-level = "s"

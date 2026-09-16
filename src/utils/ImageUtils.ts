@@ -1,6 +1,7 @@
 import type { ExifData, ExifParamsForm } from '../types'
 import domtoimage from 'dom-to-image'
 import moment from 'moment'
+import { composite_png } from '../wasm/gen_brand_photo_pictrue'
 import { BrandsList } from './BrandUtils'
 
 export const DefaultPictureExif = {
@@ -216,4 +217,86 @@ export async function rasterizeDomToDataUrl(node: HTMLElement, options: Rasteriz
   if (options.format === 'png')
     return canvas.toDataURL()
   return canvas.toDataURL('image/jpeg', options.quality ?? 1.0)
+}
+
+// 从 PNG chunk 猜测是否广色域（iCCP 名称 / cICP 原色 / sRGB chunk）
+export function pngGuessWideGamut(bytes: Uint8Array): boolean {
+  if (bytes.length < 8)
+    return false
+  const dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength)
+  let off = 8
+  let sawIccp = false
+  while (off + 12 <= bytes.length) {
+    const len = dv.getUint32(off)
+    const type = String.fromCharCode(bytes[off + 4], bytes[off + 5], bytes[off + 6], bytes[off + 7])
+    if (type === 'IDAT' || type === 'IEND')
+      break
+    const body = bytes.subarray(off + 8, off + 8 + len)
+    if (type === 'iCCP') {
+      sawIccp = true
+      const nameEnd = body.indexOf(0)
+      const name = new TextDecoder().decode(body.subarray(0, nameEnd < 0 ? 80 : nameEnd))
+      if (/p3|2020|adobe|prophoto/i.test(name))
+        return true
+    }
+    else if (type === 'cICP' && len >= 1 && (body[0] === 9 || body[0] === 12)) {
+      return true
+    }
+    else if (type === 'sRGB') {
+      return false
+    }
+    off += 12 + len
+  }
+  return sawIccp // 未知名称的 iCCP 按广色域处理（与 P3 预览一致）
+}
+
+// PNG 高保真导出：WASM 原分辨率合成，保留位深与全部元数据 chunk；
+// 不适用（palette/APNG）或失败时返回 null，由调用方回退 canvas 路径
+export async function compositePngExport(previewDom: HTMLElement, file: File): Promise<Blob | null> {
+  try {
+    const img = previewDom.querySelector('.preview-picture') as HTMLImageElement | null
+    const banner = previewDom.querySelector('.preview-info') as HTMLElement | null
+    if (!img || !banner || !img.naturalWidth || !img.naturalHeight)
+      return null
+    const bytes = new Uint8Array(await file.arrayBuffer())
+    const imgRect = img.getBoundingClientRect()
+    const bannerRect = banner.getBoundingClientRect()
+    if (!imgRect.width || !bannerRect.width || !bannerRect.height)
+      return null
+    const scale = img.naturalWidth / imgRect.width
+    const maskW = Math.max(1, Math.round(bannerRect.width * scale))
+    const maskH = Math.max(1, Math.round(bannerRect.height * scale))
+    const offX = Math.round((bannerRect.left - imgRect.left) * scale)
+    const offY = Math.round((bannerRect.top - imgRect.top) * scale)
+    if (offX < 0 || offY < 0 || offX + maskW > img.naturalWidth)
+      return null
+
+    // 横幅 DOM → 原生分辨率 RGBA mask（色彩空间与源图一致，保证与预览观感相同）
+    const bannerUrl = await rasterizeDomToDataUrl(banner, {
+      format: 'png',
+      width: maskW,
+      height: maskH,
+      style: { transform: `scale(${scale})`, transformOrigin: 'top left' },
+    })
+    const bannerImg = await loadImage(bannerUrl)
+    const wide = pngGuessWideGamut(bytes)
+    const mc = document.createElement('canvas')
+    mc.width = maskW
+    mc.height = maskH
+    const mctx = wide
+      ? mc.getContext('2d', { colorSpace: 'display-p3' })
+      : mc.getContext('2d')
+    if (!mctx)
+      return null
+    mctx.drawImage(bannerImg, 0, 0)
+    const maskData = mctx.getImageData(0, 0, maskW, maskH).data
+
+    const out = composite_png(bytes, new Uint8Array(maskData.buffer), maskW, maskH, offX, offY)
+    console.log('WASM PNG composite done:', `${img.naturalWidth}x${img.naturalHeight} -> out ${out.length}B, mask ${maskW}x${maskH}@(${offX},${offY}), wide=${wide}`)
+    return new Blob([out], { type: 'image/png' })
+  }
+  catch (e) {
+    console.warn('WASM PNG composite failed, falling back to canvas path:', e)
+    return null
+  }
 }

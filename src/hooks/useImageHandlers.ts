@@ -4,7 +4,7 @@ import type { ExifParamsForm } from '../types'
 import { message } from 'antd'
 import { useRef, useState } from 'react'
 import { getBrandUrl } from '../utils/BrandUtils'
-import { dataURLtoBlob, getRandomImage, parseExifData, rasterizeDomToDataUrl } from '../utils/ImageUtils'
+import { compositePngExport, dataURLtoBlob, getRandomImage, parseExifData, rasterizeDomToDataUrl } from '../utils/ImageUtils'
 import { embedExifRaw, extractExifRaw } from '../utils/JpegExifUtils'
 import { detect_hdr, get_exif } from '../wasm/gen_brand_photo_pictrue'
 
@@ -13,6 +13,7 @@ export function useImageHandlers(formRef: any, initialFormValue: ExifParamsForm)
   const [imgUrl, setImgUrl] = useState<string>(getRandomImage())
   const imgRef = useRef<HTMLImageElement>(null)
   const [uploadImgType, setUploadImgType] = useState<string>()
+  const [uploadFile, setUploadFile] = useState<RcFile | null>(null)
   const [exifBlob, setExifBlob] = useState<Blob | null>(null)
 
   // 探测浏览器能否解码该图片（Chrome/Firefox 不支持 HEIC）
@@ -65,6 +66,7 @@ export function useImageHandlers(formRef: any, initialFormValue: ExifParamsForm)
         setFormValue(updatedFormValue)
         setImgUrl(blobUrl)
         setUploadImgType(file.type)
+        setUploadFile(file)
         try {
           setExifBlob(await extractExifRaw(new Blob([file])))
         }
@@ -88,36 +90,42 @@ export function useImageHandlers(formRef: any, initialFormValue: ExifParamsForm)
     const zoomRatio = 4
 
     try {
-      const rasterOptions = {
-        width: previewDom.clientWidth * zoomRatio,
-        height: previewDom.clientHeight * zoomRatio,
-        style: { transform: `scale(${zoomRatio})`, transformOrigin: 'top left' },
+      let downloadBlob: Blob | null = null
+      let dataUrl = ''
+
+      // PNG 输入优先走 WASM 高保真管线（原分辨率/位深/元数据保留）
+      if (uploadImgType === 'image/png' && uploadFile) {
+        console.log('wasm png composite export')
+        downloadBlob = await compositePngExport(previewDom, uploadFile)
       }
-      let dataUrl: string
-      if (uploadImgType === 'image/png') {
-        console.log('dom to png')
-        dataUrl = await rasterizeDomToDataUrl(previewDom, { ...rasterOptions, format: 'png' })
-      }
-      else {
-        dataUrl = await rasterizeDomToDataUrl(previewDom, { ...rasterOptions, format: 'jpeg', quality: 1.0 })
+
+      if (!downloadBlob) {
+        // canvas 路径：JPEG 导出，或 PNG 的回退
+        const rasterOptions = {
+          width: previewDom.clientWidth * zoomRatio,
+          height: previewDom.clientHeight * zoomRatio,
+          style: { transform: `scale(${zoomRatio})`, transformOrigin: 'top left' },
+        }
+        if (uploadImgType === 'image/png') {
+          console.log('dom to png')
+          dataUrl = await rasterizeDomToDataUrl(previewDom, { ...rasterOptions, format: 'png' })
+        }
+        else {
+          dataUrl = await rasterizeDomToDataUrl(previewDom, { ...rasterOptions, format: 'jpeg', quality: 1.0 })
+        }
+        if (exifEnable && exifBlob) {
+          if (uploadImgType === 'image/jpeg' || uploadImgType === 'image/jpg') {
+            console.log('embed exif in jpg')
+            downloadBlob = await embedExifRaw(exifBlob, dataURLtoBlob(dataUrl))
+          }
+          else {
+            console.warn('EXIF blob data can only be embedded in JPEG or JPG images.')
+          }
+        }
       }
 
       const link = document.createElement('a')
-      if (exifEnable && exifBlob) {
-        if (uploadImgType === 'image/jpeg' || uploadImgType === 'image/jpg') {
-          console.log('embed exif in jpg')
-          const imgBlob = dataURLtoBlob(dataUrl)
-          const downloadImg = await embedExifRaw(exifBlob, imgBlob)
-          link.href = URL.createObjectURL(downloadImg)
-        }
-        else {
-          console.warn('EXIF blob data can only be embedded in JPEG or JPG images.')
-          link.href = dataUrl
-        }
-      }
-      else {
-        link.href = dataUrl
-      }
+      link.href = downloadBlob ? URL.createObjectURL(downloadBlob) : dataUrl
       // 扩展名跟随实际输出格式（PNG 输入输出 PNG，其余输出 JPEG）
       const fileExt = uploadImgType === 'image/png' ? 'png' : 'jpg'
       link.download = `${Date.now()}.${fileExt}`
