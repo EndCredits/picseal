@@ -108,6 +108,71 @@ fn nclx_is_hdr(data: &[u8]) -> bool {
     false
 }
 
+// Parse an MPF (CIPA DC-007) APP2 payload; returns (offset, size) of the
+// second individual image, offset relative to the MP header (TIFF) start.
+fn mpf_second_image(seg: &[u8]) -> Option<(usize, usize)> {
+    if seg.len() < 14 || &seg[..4] != b"MPF\0" {
+        return None;
+    }
+    let tiff = &seg[4..];
+    let le = match &tiff[..2] {
+        b"II" => true,
+        b"MM" => false,
+        _ => return None,
+    };
+    let u16at = |o: usize| -> Option<u16> {
+        if o + 2 <= tiff.len() {
+            Some(if le { u16::from_le_bytes([tiff[o], tiff[o + 1]]) } else { u16::from_be_bytes([tiff[o], tiff[o + 1]]) })
+        } else {
+            None
+        }
+    };
+    let u32at = |o: usize| -> Option<u32> {
+        if o + 4 <= tiff.len() {
+            Some(if le {
+                u32::from_le_bytes([tiff[o], tiff[o + 1], tiff[o + 2], tiff[o + 3]])
+            } else {
+                u32::from_be_bytes([tiff[o], tiff[o + 1], tiff[o + 2], tiff[o + 3]])
+            })
+        } else {
+            None
+        }
+    };
+    if u16at(2)? != 42 {
+        return None;
+    }
+    let ifd = u32at(4)? as usize;
+    let count = u16at(ifd)? as usize;
+    if count == 0 || count > 64 {
+        return None;
+    }
+    let mut num_images = 0usize;
+    let mut entries: Option<(usize, usize)> = None;
+    for i in 0..count {
+        let e = ifd + 2 + i * 12;
+        let tag = u16at(e)?;
+        let typ = u16at(e + 2)?;
+        let cnt = u32at(e + 4)? as usize;
+        match tag {
+            0xB001 => num_images = if typ == 3 { u16at(e + 8)? as usize } else { u32at(e + 8)? as usize },
+            0xB002 if (32..=1024).contains(&cnt) => {
+                entries = Some((u32at(e + 8)? as usize, cnt));
+            }
+            _ => {}
+        }
+    }
+    if num_images > 0 && num_images < 2 {
+        return None;
+    }
+    let (mpe, _) = entries?;
+    if mpe + 32 > tiff.len() {
+        return None;
+    }
+    let size = u32at(mpe + 20)? as usize;
+    let off = u32at(mpe + 24)? as usize;
+    Some((off, size))
+}
+
 fn detect_hdr_inner(raw: &[u8]) -> HdrInfo {
     let none = HdrInfo { is_hdr: false, kind: String::new() };
     if raw.len() < 16 {
@@ -172,6 +237,27 @@ fn detect_hdr_inner(raw: &[u8]) -> HdrInfo {
                     || contains(seg, b"urn:iso:std:iso:ts:21496:-1")
                 {
                     return hdr("jpeg-gainmap");
+                }
+                // Apple-style gain map: base carries no HDR marker, the aux
+                // image URN lives in the second MPF image (follows the photo)
+                if marker == 0xE2 {
+                    if let Some((img_off, img_size)) = mpf_second_image(seg) {
+                        let abs = off + 8 + img_off;
+                        if abs < raw.len() {
+                            let end = if img_size == 0 { raw.len() } else { abs.saturating_add(img_size).min(raw.len()) };
+                            let end = end.min(abs.saturating_add(4 * 1024 * 1024));
+                            let second = &raw[abs..end];
+                            if contains(second, b"hdrgainmap") || contains(second, b"HDRGainMap") {
+                                return hdr("apple-gainmap");
+                            }
+                            if contains(second, b"hdrgm:")
+                                || contains(second, b"hdr-gain-map")
+                                || contains(second, b"urn:iso:std:iso:ts:21496:-1")
+                            {
+                                return hdr("jpeg-gainmap");
+                            }
+                        }
+                    }
                 }
             }
             off += 2 + seg_len;
@@ -778,5 +864,132 @@ mod tests {
         assert_eq!(diff_outside, 0, "pixels outside mask must be bit-identical");
         assert!(checked_inside > 0);
         assert_eq!(bad_inside, 0, "blended pixels wrong");
+    }
+
+    // Build a JPEG whose APP2 carries an MPF directory pointing at an appended
+    // second individual image (mirrors Apple gain map JPEG layout)
+    fn mpf_test_jpeg(second: &[u8], num_images: u32, real_size: bool) -> Vec<u8> {
+        let mut tiff = Vec::new();
+        tiff.extend_from_slice(b"II");
+        tiff.extend_from_slice(&42u16.to_le_bytes());
+        tiff.extend_from_slice(&8u32.to_le_bytes());
+        let mpe_off = 8 + 2 + 24 + 4;
+        tiff.extend_from_slice(&2u16.to_le_bytes());
+        tiff.extend_from_slice(&0xB001u16.to_le_bytes());
+        tiff.extend_from_slice(&4u16.to_le_bytes());
+        tiff.extend_from_slice(&1u32.to_le_bytes());
+        tiff.extend_from_slice(&num_images.to_le_bytes());
+        tiff.extend_from_slice(&0xB002u16.to_le_bytes());
+        tiff.extend_from_slice(&7u16.to_le_bytes());
+        tiff.extend_from_slice(&32u32.to_le_bytes());
+        tiff.extend_from_slice(&(mpe_off as u32).to_le_bytes());
+        tiff.extend_from_slice(&0u32.to_le_bytes());
+        tiff.extend_from_slice(&0u32.to_le_bytes());
+        tiff.extend_from_slice(&4u32.to_le_bytes());
+        tiff.extend_from_slice(&0u32.to_le_bytes());
+        tiff.extend_from_slice(&0u32.to_le_bytes());
+        tiff.extend_from_slice(&0u32.to_le_bytes());
+        tiff.extend_from_slice(&(if real_size { second.len() as u32 } else { 0 }).to_le_bytes());
+        let off_field = tiff.len();
+        tiff.extend_from_slice(&0u32.to_le_bytes());
+        tiff.extend_from_slice(&0u32.to_le_bytes());
+
+        let mut jpeg = vec![0xFF, 0xD8];
+        let payload_len = 4 + tiff.len();
+        jpeg.extend_from_slice(&[0xFF, 0xE2]);
+        jpeg.extend_from_slice(&((payload_len + 2) as u16).to_be_bytes());
+        jpeg.extend_from_slice(b"MPF\0");
+        let tiff_start = jpeg.len();
+        jpeg.extend_from_slice(&tiff);
+        jpeg.extend_from_slice(&[0xFF, 0xDA, 0x00, 0x02]);
+        let img_abs = jpeg.len();
+        let off_val = (img_abs - tiff_start) as u32;
+        jpeg[tiff_start + off_field..tiff_start + off_field + 4].copy_from_slice(&off_val.to_le_bytes());
+        jpeg.extend_from_slice(second);
+        jpeg
+    }
+
+    fn fake_aux_image(meta: &[u8]) -> Vec<u8> {
+        let mut v = vec![0xFF, 0xD8, 0xFF, 0xE1];
+        let payload_len = 4 + meta.len();
+        v.extend_from_slice(&((payload_len + 2) as u16).to_be_bytes());
+        v.extend_from_slice(b"XMP\0");
+        v.extend_from_slice(meta);
+        v.extend_from_slice(&[0xFF, 0xD9]);
+        v
+    }
+
+    #[test]
+    fn jpeg_mpf_apple_gainmap_is_hdr() {
+        let meta = b"<x:xmpmeta xmlns:apdi='http://ns.apple.com/HDRGainMap/1.0/'><apdi:AuxiliaryImageType>urn:com:apple:photo:2020:aux:hdrgainmap</apdi:AuxiliaryImageType></x:xmpmeta>";
+        let jpeg = mpf_test_jpeg(&fake_aux_image(meta), 2, true);
+        let info = detect_hdr_inner(&jpeg);
+        assert!(info.is_hdr && info.kind == "apple-gainmap");
+    }
+
+    #[test]
+    fn jpeg_mpf_iso_or_xmp_gainmap_is_hdr() {
+        for meta in [b"urn:iso:std:iso:ts:21496:-1".as_slice(), b"hdrgm:Version='1.0'".as_slice()] {
+            let jpeg = mpf_test_jpeg(&fake_aux_image(meta), 2, true);
+            let info = detect_hdr_inner(&jpeg);
+            assert!(info.is_hdr && info.kind == "jpeg-gainmap");
+        }
+    }
+
+    #[test]
+    fn jpeg_mpf_stereo_pair_is_not_hdr() {
+        let jpeg = mpf_test_jpeg(&fake_aux_image(b"plain second image, no gain map metadata"), 2, true);
+        assert!(!detect_hdr_inner(&jpeg).is_hdr);
+    }
+
+    #[test]
+    fn jpeg_mpf_single_image_is_not_hdr() {
+        let meta = b"urn:com:apple:photo:2020:aux:hdrgainmap";
+        let jpeg = mpf_test_jpeg(&fake_aux_image(meta), 1, true);
+        assert!(!detect_hdr_inner(&jpeg).is_hdr);
+    }
+
+    #[test]
+    fn jpeg_mpf_zero_size_scans_tail() {
+        let meta = b"urn:com:apple:photo:2020:aux:hdrgainmap";
+        let jpeg = mpf_test_jpeg(&fake_aux_image(meta), 2, false);
+        let info = detect_hdr_inner(&jpeg);
+        assert!(info.is_hdr && info.kind == "apple-gainmap");
+    }
+
+    #[test]
+    fn jpeg_mpf_truncation_is_safe() {
+        let meta = b"urn:com:apple:photo:2020:aux:hdrgainmap";
+        let jpeg = mpf_test_jpeg(&fake_aux_image(meta), 2, true);
+        let full = jpeg.len();
+        for cut in [8usize, 20, 40, full / 2, full - 1] {
+            let _ = detect_hdr_inner(&jpeg[..cut.min(full)]);
+        }
+        for shrink in [8usize, 9, 10, 12] {
+            let _ = detect_hdr_inner(&jpeg[..full - shrink]);
+        }
+    }
+
+    #[test]
+    fn real_hdr_samples_if_present() {
+        let cases = [
+            ("../test_pictures/IMG_9519.HEIC", "apple-gainmap"),
+            ("../test_pictures/IMG_9538.HEIC", "iso-21496-1"),
+            ("../test_pictures/apple_gainmap_new.jpg", "apple-gainmap"),
+            ("../test_pictures/apple_gainmap_old.jpg", "apple-gainmap"),
+            ("../test_pictures/synthetic-ultrahdr.jpg", "jpeg-gainmap"),
+        ];
+        let mut ran = 0;
+        for (p, kind) in cases {
+            if let Ok(b) = std::fs::read(p) {
+                ran += 1;
+                let info = detect_hdr_inner(&b);
+                assert!(info.is_hdr, "{p} must be HDR");
+                assert_eq!(info.kind, kind, "{p} kind");
+            }
+        }
+        if ran == 0 {
+            eprintln!("SKIP: no local samples in test_pictures/");
+        }
     }
 }
