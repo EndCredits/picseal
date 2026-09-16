@@ -3,15 +3,18 @@ import { visualizer } from 'rollup-plugin-visualizer'
 import { defineConfig } from 'vite'
 import { ViteImageOptimizer } from 'vite-plugin-image-optimizer'
 import { VitePWA } from 'vite-plugin-pwa'
-import topLevelAwait from 'vite-plugin-top-level-await'
 import wasm from 'vite-plugin-wasm'
 
 export default defineConfig({
   plugins: [
     react(),
     wasm(),
-    topLevelAwait(),
-    VitePWA(),
+    VitePWA({
+      workbox: {
+        // libheif（HEIC 回退解码，~1.9MB）按需加载，不进预缓存
+        globIgnores: ['**/libheif/**'],
+      },
+    }),
     visualizer({ open: false }),
     ViteImageOptimizer({
       test: /\.(jpe?g|png|gif|tiff|webp|svg|avif)$/i,

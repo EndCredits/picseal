@@ -73,7 +73,6 @@
      plugins: [
        react(),
        wasm(),
-       topLevelAwait(),
        visualizer({ open: true }),
      ],
      server: {

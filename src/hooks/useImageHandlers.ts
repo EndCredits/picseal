@@ -1,9 +1,11 @@
 import type { RcFile } from 'antd/es/upload'
 
 import type { ExifParamsForm } from '../types'
+import type { HeicDecodeResult } from '../utils/HeicUtils'
 import { message } from 'antd'
 import { useRef, useState } from 'react'
 import { getBrandUrl } from '../utils/BrandUtils'
+import { decodeHeicToJpeg } from '../utils/HeicUtils'
 import { compositePngExport, dataURLtoBlob, getRandomImage, parseExifData, rasterizeDomToDataUrl } from '../utils/ImageUtils'
 import { embedExifRaw, extractExifRaw } from '../utils/JpegExifUtils'
 import { compositeUltraHdrExport } from '../utils/UltraHdrUtils'
@@ -40,22 +42,34 @@ export function useImageHandlers(formRef: any, initialFormValue: ExifParamsForm)
         if (hdrInfo?.is_hdr)
           console.log('HDR input detected: ', hdrInfo.kind)
 
-        const blobUrl = URL.createObjectURL(file)
+        let blobUrl = URL.createObjectURL(file)
+        let previewType = file.type
+        let wasmDecodedHeic: HeicDecodeResult | null = null
         if (!await canDecode(blobUrl)) {
+          const isHeic = /heic|heif/i.test(file.type) || /\.(?:heic|heif)$/i.test(file.name)
+          // 非 WebKit 浏览器：懒加载 libheif wasm 解 HEIC（SDR），保留预览/导出可用
+          wasmDecodedHeic = isHeic ? await decodeHeicToJpeg(file) : null
+          if (!wasmDecodedHeic) {
+            URL.revokeObjectURL(blobUrl)
+            if (hdrInfo?.is_hdr)
+              message.warning('当前浏览器无法解码该 HDR 图片，请使用 Safari 打开，或先转换为 SDR 的 JPEG/PNG 再上传', 5)
+            else if (isHeic)
+              message.warning('HEIC 解码失败，请使用 Safari 打开，或先转换为 JPEG/PNG 再上传', 5)
+            else
+              message.warning('当前浏览器无法解码该图片格式，请换一张照片', 5)
+            return
+          }
           URL.revokeObjectURL(blobUrl)
-          if (hdrInfo?.is_hdr)
-            message.warning('当前浏览器无法解码该 HDR 图片，请使用 Safari 打开，或先转换为 SDR 的 JPEG/PNG 再上传', 5)
-          else if (/heic|heif/i.test(file.type))
-            message.warning('当前浏览器不支持 HEIC，请使用 Safari 打开，或先转换为 JPEG/PNG 再上传', 5)
-          else
-            message.warning('当前浏览器无法解码该图片格式，请换一张照片', 5)
-          return
+          blobUrl = URL.createObjectURL(wasmDecodedHeic.blob)
+          previewType = 'image/jpeg'
         }
 
         const gainMapJpeg = !!hdrInfo?.is_hdr && hdrInfo.kind === 'jpeg-gainmap'
         const hdrPng = !!hdrInfo?.is_hdr && file.type === 'image/png' && hdrInfo.kind.startsWith('png-')
         setHdrGainMapJpeg(gainMapJpeg)
-        if (gainMapJpeg)
+        if (wasmDecodedHeic)
+          message.info(`当前浏览器不支持 HEIC，已用内置解码器转为 SDR 预览（${wasmDecodedHeic.width}×${wasmDecodedHeic.height}，${wasmDecodedHeic.ms}ms）${hdrInfo?.is_hdr ? '；导出将丢失 HDR' : ''}`, 5)
+        else if (gainMapJpeg)
           message.info('检测到 HDR（gain map JPEG）：导出将保留 HDR，水印区域按 SDR 白处理', 5)
         else if (hdrPng && hdrInfo.kind !== 'png-hlg')
           message.info('检测到 HDR PNG（PQ）：导出保留 HDR，水印按 203nit / 目标原色映射', 5)
@@ -76,7 +90,7 @@ export function useImageHandlers(formRef: any, initialFormValue: ExifParamsForm)
         formRef.current.setFieldsValue(updatedFormValue)
         setFormValue(updatedFormValue)
         setImgUrl(blobUrl)
-        setUploadImgType(file.type)
+        setUploadImgType(previewType)
         setUploadFile(file)
         try {
           setExifBlob(await extractExifRaw(new Blob([file])))
