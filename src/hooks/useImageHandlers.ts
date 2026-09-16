@@ -53,9 +53,14 @@ export function useImageHandlers(formRef: any, initialFormValue: ExifParamsForm)
         }
 
         const gainMapJpeg = !!hdrInfo?.is_hdr && hdrInfo.kind === 'jpeg-gainmap'
+        const hdrPng = !!hdrInfo?.is_hdr && file.type === 'image/png' && hdrInfo.kind.startsWith('png-')
         setHdrGainMapJpeg(gainMapJpeg)
         if (gainMapJpeg)
           message.info('检测到 HDR（gain map JPEG）：导出将保留 HDR，水印区域按 SDR 白处理', 300)
+        else if (hdrPng && hdrInfo.kind !== 'png-hlg')
+          message.info('检测到 HDR PNG：导出将保留 HDR，水印按 203nit 映射（sRGB→BT.2020）', 300)
+        else if (hdrPng)
+          message.info('检测到 HDR PNG（HLG）：导出保留 HDR 像素，水印暂按码值叠加', 300)
         else if (hdrInfo?.is_hdr)
           message.warning('检测到 HDR 照片：导出后将丢失 HDR 信息，输出为 SDR', 300)
 

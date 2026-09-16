@@ -192,8 +192,11 @@ fn detect_hdr_inner(raw: &[u8]) -> HdrInfo {
                 break;
             }
             let body = &raw[body_start..body_end];
-            if typ == b"cICP" && len >= 2 && (body[1] == 16 || body[1] == 18) {
+            if typ == b"cICP" && len >= 2 && body[1] == 16 {
                 return hdr("png-pq");
+            }
+            if typ == b"cICP" && len >= 2 && body[1] == 18 {
+                return hdr("png-hlg");
             }
             if typ == b"mDCv" || typ == b"cLLi" {
                 return hdr("png-static-hdr");
@@ -785,6 +788,135 @@ fn write_chunk(out: &mut Vec<u8>, typ: &[u8; 4], data: &[u8]) {
     out.extend_from_slice(&hasher.finalize().to_be_bytes());
 }
 
+// ---- HDR PNG watermark encoding ----
+// The banner mask is authored against 203-nit SDR reference white (BT.2408).
+// For PQ canvases the watermark must be encoded in the target's primaries:
+// mask codes are sRGB (JS renders the mask as sRGB for PQ sources), converted
+// to the source's primaries before the PQ transfer. Photo pixels are untouched.
+
+const WATERMARK_SDR_WHITE_NITS: f64 = 203.0;
+
+#[derive(Clone, Copy, PartialEq)]
+enum PngPrimaries {
+    Bt709,
+    P3,
+    Bt2020,
+}
+
+fn png_is_pq(chunks: &[PngChunk]) -> bool {
+    if let Some(c) = chunks.iter().find(|c| c.typ == *b"cICP") {
+        return c.data.get(1).copied() == Some(16);
+    }
+    // mDCv/cLLi without cICP: static HDR metadata, PQ is the de-facto transfer
+    chunks.iter().any(|c| c.typ == *b"mDCv" || c.typ == *b"cLLi")
+}
+
+fn png_primaries(chunks: &[PngChunk]) -> PngPrimaries {
+    match chunks.iter().find(|c| c.typ == *b"cICP").and_then(|c| c.data.first()).copied() {
+        Some(1) => PngPrimaries::Bt709,
+        Some(12) => PngPrimaries::P3,
+        _ => PngPrimaries::Bt2020,
+    }
+}
+
+fn srgb_to_linear(v: f64) -> f64 {
+    if v <= 0.04045 {
+        v / 12.92
+    } else {
+        ((v + 0.055) / 1.055).powf(2.4)
+    }
+}
+
+// ST.2084 (PQ) OETF: absolute luminance in nits → normalized code [0, 1]
+fn pq_oetf(nits: f64) -> f64 {
+    const M1: f64 = 2610.0 / 16384.0;
+    const M2: f64 = 2523.0 / 4096.0 * 128.0;
+    const C1: f64 = 3424.0 / 4096.0;
+    const C2: f64 = 2413.0 / 4096.0 * 32.0;
+    const C3: f64 = 2392.0 / 4096.0 * 32.0;
+    let y = (nits / 10000.0).max(0.0);
+    let ym = y.powf(M1);
+    ((C1 + C2 * ym) / (1.0 + C3 * ym)).powf(M2)
+}
+
+// Linear sRGB → linear target primaries (D65), row sums = 1 (white preserved)
+fn srgb_to_target_matrix(p: PngPrimaries) -> [[f64; 3]; 3] {
+    match p {
+        PngPrimaries::Bt709 => [
+            [1.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+            [0.0, 0.0, 1.0],
+        ],
+        PngPrimaries::P3 => [
+            [0.822462, 0.177538, 0.0],
+            [0.033194, 0.966806, 0.0],
+            [0.017083, 0.072397, 0.910520],
+        ],
+        PngPrimaries::Bt2020 => [
+            [0.627404, 0.329283, 0.0433136],
+            [0.069097, 0.919540, 0.0113623],
+            [0.0163916, 0.0880132, 0.895595],
+        ],
+    }
+}
+
+fn straight_code(mask8: u8, sixteen: bool) -> u32 {
+    if sixteen {
+        mask8 as u32 * 257
+    } else {
+        mask8 as u32
+    }
+}
+
+fn watermark_codes(mask_px: [u8; 3], pq: bool, primaries: PngPrimaries, sixteen: bool) -> [u32; 3] {
+    let scale = if sixteen { 65535u32 } else { 255u32 };
+    if !pq {
+        return [
+            straight_code(mask_px[0], sixteen),
+            straight_code(mask_px[1], sixteen),
+            straight_code(mask_px[2], sixteen),
+        ];
+    }
+    let m = srgb_to_target_matrix(primaries);
+    let lin = [
+        srgb_to_linear(mask_px[0] as f64 / 255.0),
+        srgb_to_linear(mask_px[1] as f64 / 255.0),
+        srgb_to_linear(mask_px[2] as f64 / 255.0),
+    ];
+    let mut out = [0u32; 3];
+    for c in 0..3 {
+        let v = m[c][0] * lin[0] + m[c][1] * lin[1] + m[c][2] * lin[2];
+        let code = (pq_oetf(v * WATERMARK_SDR_WHITE_NITS) * scale as f64 + 0.5).floor();
+        out[c] = (code as u32).min(scale);
+    }
+    out
+}
+
+// The png crate rejects cICP with matrix_coefficients != 0 (PNG is RGB-only),
+// but real-world PQ PNGs often carry 9 (BT.2020 NCLX). Decode a copy with the
+// matrix zeroed; the output chunk is normalized the same way (matrix is
+// meaningless for RGB, bytes for primaries/transfer are preserved).
+fn sanitized_for_decode(original: &[u8], chunks: &[PngChunk]) -> Option<Vec<u8>> {
+    let needs = chunks
+        .iter()
+        .any(|c| c.typ == *b"cICP" && c.data.len() >= 3 && c.data[2] != 0);
+    if !needs {
+        return None;
+    }
+    let mut out = Vec::with_capacity(original.len());
+    out.extend_from_slice(&PNG_SIG);
+    for c in chunks {
+        if c.typ == *b"cICP" && c.data.len() >= 3 && c.data[2] != 0 {
+            let mut data = c.data.clone();
+            data[2] = 0;
+            write_chunk(&mut out, &c.typ, &data);
+        } else {
+            write_chunk(&mut out, &c.typ, &c.data);
+        }
+    }
+    Some(out)
+}
+
 fn png_composite(
     original: &[u8],
     mask: &[u8],
@@ -807,7 +939,9 @@ fn png_composite(
     }
 
     // Decode at native bit depth (EXPAND: tRNS→alpha, <8bit gray→8bit)
-    let mut decoder = png::Decoder::new(std::io::Cursor::new(original));
+    let decode_owned = sanitized_for_decode(original, &chunks);
+    let decode_src: &[u8] = decode_owned.as_deref().unwrap_or(original);
+    let mut decoder = png::Decoder::new(std::io::Cursor::new(decode_src));
     decoder.set_transformations(png::Transformations::EXPAND);
     let mut reader = decoder.read_info().map_err(|e| format!("decode: {e}"))?;
     let mut buf = vec![0u8; reader.output_buffer_size().ok_or_else(|| "bad PNG geometry".to_string())?];
@@ -825,12 +959,36 @@ fn png_composite(
         return Err("mask wider than image".to_string());
     }
     // Vertical extension: watermark banner below the photo extends the canvas
-    // (gap/pad rows filled with opaque white, matching the preview background)
+    // (gap/pad rows filled with the source's reference white, 203-nit PQ for HDR)
+    let pq = png_is_pq(&chunks);
+    let primaries = png_primaries(&chunks);
+    let white_codes = watermark_codes([255, 255, 255], pq, primaries, sixteen);
     let out_h = h.max(off_y + mask_h);
     let row_bytes = w * bps;
     let mut canvas: Vec<u8> = if out_h > h {
-        let mut ext = vec![0xFFu8; out_h * row_bytes];
-        ext[..h * row_bytes].copy_from_slice(&buf);
+        let mut row = vec![0xFFu8; row_bytes];
+        if pq {
+            let mut i = 0usize;
+            for _ in 0..w {
+                for c in 0..channels {
+                    let code = if c == 3 { if sixteen { 65535 } else { 255 } } else { white_codes[c.min(2)] };
+                    if sixteen {
+                        let b = (code as u16).to_ne_bytes();
+                        row[i] = b[0];
+                        row[i + 1] = b[1];
+                        i += 2;
+                    } else {
+                        row[i] = code as u8;
+                        i += 1;
+                    }
+                }
+            }
+        }
+        let mut ext = Vec::with_capacity(out_h * row_bytes);
+        ext.extend_from_slice(&buf);
+        for _ in h..out_h {
+            ext.extend_from_slice(&row);
+        }
         ext
     } else {
         buf
@@ -846,22 +1004,25 @@ fn png_composite(
             }
             let inv = 255 - a;
             let di = ((off_y + my) * w + (off_x + mx)) * bps;
+            // grayscale target uses mask luma; RGB(A) uses matching channel
+            let mask_px = if channels >= 3 {
+                [mask[mi], mask[mi + 1], mask[mi + 2]]
+            } else {
+                let l = ((mask[mi] as u32 * 77 + mask[mi + 1] as u32 * 150 + mask[mi + 2] as u32 * 29) >> 8) as u8;
+                [l, l, l]
+            };
+            let codes = watermark_codes(mask_px, pq, primaries, sixteen);
             for c in 0..channels {
-                // grayscale target uses mask luma; RGB(A) uses matching channel
-                let wm8 = if channels >= 3 {
-                    mask[mi + c.min(2)] as u32
-                } else {
-                    ((mask[mi] as u32 * 77 + mask[mi + 1] as u32 * 150 + mask[mi + 2] as u32 * 29) >> 8)
-                };
+                let wm_code = if c == 3 { straight_code(mask[mi + 2], sixteen) } else { codes[c.min(2)] };
                 if sixteen {
                     let src = u16::from_ne_bytes([canvas[di + c * 2], canvas[di + c * 2 + 1]]) as u32;
-                    let out = (src * inv + wm8 * 257 * a + 127) / 255;
+                    let out = (src * inv + wm_code * a + 127) / 255;
                     let outb = (out as u16).to_ne_bytes();
                     canvas[di + c * 2] = outb[0];
                     canvas[di + c * 2 + 1] = outb[1];
                 } else {
                     let src = canvas[di + c] as u32;
-                    canvas[di + c] = ((src * inv + wm8 * a + 127) / 255) as u8;
+                    canvas[di + c] = ((src * inv + wm_code * a + 127) / 255) as u8;
                 }
             }
         }
@@ -892,6 +1053,14 @@ fn png_composite(
             continue;
         }
         if c.typ == *b"tRNS" && has_alpha_out {
+            continue;
+        }
+        // matrix_coefficients is meaningless for RGB PNG and must be 0 per spec;
+        // normalize so the output stays decodable (same as sanitized_for_decode)
+        if c.typ == *b"cICP" && c.data.len() >= 3 && c.data[2] != 0 {
+            let mut data = c.data.clone();
+            data[2] = 0;
+            write_chunk(&mut out, &c.typ, &data);
             continue;
         }
         write_chunk(&mut out, &c.typ, &c.data);
@@ -1430,6 +1599,122 @@ mod tests {
         if ran == 0 {
             eprintln!("SKIP: no local samples in test_pictures/");
         }
+    }
+
+    // ---- HDR PNG watermark mapping tests ----
+
+    fn with_cicp(png: Vec<u8>, data: [u8; 4]) -> Vec<u8> {
+        let chunks = parse_png_chunks(&png).unwrap();
+        let mut out = Vec::new();
+        out.extend_from_slice(&PNG_SIG);
+        for c in &chunks {
+            write_chunk(&mut out, &c.typ, &c.data);
+            if c.typ == *b"IHDR" {
+                write_chunk(&mut out, b"cICP", &data);
+            }
+        }
+        out
+    }
+
+    fn decode_png_buf(data: &[u8]) -> (png::OutputInfo, Vec<u8>) {
+        let decoder = png::Decoder::new(std::io::Cursor::new(data));
+        let mut reader = decoder.read_info().unwrap();
+        let mut buf = vec![0u8; reader.output_buffer_size().unwrap()];
+        let info = reader.next_frame(&mut buf).unwrap();
+        buf.truncate(info.buffer_size());
+        (info, buf)
+    }
+
+    #[test]
+    fn pq_oetf_203nit_reference() {
+        let v = pq_oetf(WATERMARK_SDR_WHITE_NITS);
+        assert!((v - 0.5806888810416109).abs() < 1e-9, "{v}");
+        // achromatic invariant: white maps to 203-nit PQ in every primaries set
+        for p in [PngPrimaries::Bt709, PngPrimaries::P3, PngPrimaries::Bt2020] {
+            assert_eq!(watermark_codes([255; 3], true, p, false), [148; 3]);
+            assert_eq!(watermark_codes([255; 3], true, p, true), [38055; 3]);
+        }
+        assert_eq!(watermark_codes([255; 3], false, PngPrimaries::Bt2020, false), [255; 3]);
+        assert_eq!(watermark_codes([255; 3], false, PngPrimaries::Bt2020, true), [65535; 3]);
+        // saturated red: primaries conversion must be applied (sRGB → target)
+        assert_eq!(watermark_codes([255, 0, 0], true, PngPrimaries::Bt2020, true), [34900, 21431, 14422]);
+        assert_eq!(watermark_codes([255, 0, 0], true, PngPrimaries::P3, true), [36723, 17660, 14601]);
+        assert_eq!(watermark_codes([35; 3], true, PngPrimaries::Bt2020, true), [14530; 3]);
+    }
+
+    #[test]
+    fn png_cicp_hlg_kind() {
+        let png = png_with_chunks(&[png_chunk(b"cICP", &[9, 18, 9, 1])]);
+        let info = detect_hdr_inner(&png);
+        assert!(info.is_hdr && info.kind == "png-hlg");
+    }
+
+    #[test]
+    fn png_composite_pq_watermark_maps_to_203nit() {
+        let src = with_cicp(encode_test_png(2, 2, true, false, 100), [9, 16, 9, 1]);
+        let mut mask = vec![0u8; 2 * 4];
+        mask[0..4].copy_from_slice(&[255, 255, 255, 255]);
+        mask[4..8].copy_from_slice(&[255, 0, 0, 128]);
+        let out = png_composite(&src, &mask, 2, 1, 0, 0).unwrap();
+        let (info, buf) = decode_png_buf(&out);
+        assert_eq!(info.bit_depth, png::BitDepth::Sixteen);
+        let ch = |x: usize, y: usize, c: usize| {
+            let i = (y * 2 + x) * 6 + c * 2;
+            u32::from(u16::from_ne_bytes([buf[i], buf[i + 1]]))
+        };
+        assert_eq!(ch(0, 0, 0), 38055, "opaque white → 203nit PQ code");
+        assert_eq!((ch(1, 0, 0), ch(1, 0, 1), ch(1, 0, 2)), (17568, 10808, 7290), "alpha blend uses sRGB→BT.2020 mapped codes");
+        assert_eq!(ch(1, 1, 0), 100, "untouched pixel unchanged");
+        assert!(parse_png_chunks(&out).unwrap().iter().any(|c| c.typ == *b"cICP" && c.data == vec![9, 16, 0, 1]), "cICP matrix normalized to 0");
+    }
+
+    #[test]
+    fn png_composite_hlg_keeps_code_domain() {
+        let src = with_cicp(encode_test_png(1, 1, false, false, 100), [9, 18, 9, 1]);
+        let mask = vec![255u8; 4];
+        let out = png_composite(&src, &mask, 1, 1, 0, 0).unwrap();
+        let (_, buf) = decode_png_buf(&out);
+        assert_eq!(buf[0], 255, "HLG is not PQ-mapped (documented limitation)");
+    }
+
+    #[test]
+    fn png_composite_pq_extension_fills_203nit() {
+        let src = with_cicp(encode_test_png(2, 2, true, false, 100), [9, 16, 9, 1]);
+        let mask = vec![0u8; 2 * 2 * 4];
+        let out = png_composite(&src, &mask, 2, 2, 0, 2).unwrap();
+        let (info, buf) = decode_png_buf(&out);
+        assert_eq!((info.width, info.height), (2, 4));
+        let ch = |x: usize, y: usize, c: usize| {
+            let i = (y * 2 + x) * 6 + c * 2;
+            u32::from(u16::from_ne_bytes([buf[i], buf[i + 1]]))
+        };
+        for y in 2..4 {
+            for x in 0..2 {
+                for c in 0..3 {
+                    assert_eq!(ch(x, y, c), 38055, "extension row must be 203nit PQ white");
+                }
+            }
+        }
+        assert_eq!(ch(0, 0, 0), 100, "photo rows unchanged");
+    }
+
+    #[test]
+    fn png_composite_real_pq_sample_if_present() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../test_pictures/synthetic-hdr-pq.png");
+        if !path.exists() {
+            eprintln!("SKIP: {} not found", path.display());
+            return;
+        }
+        let src = std::fs::read(&path).unwrap();
+        let mask = vec![255u8; 4];
+        let out = png_composite(&src, &mask, 1, 1, 0, 0).unwrap();
+        let (info, buf) = decode_png_buf(&out);
+        assert_eq!((info.width, info.height), (1, 1));
+        assert_eq!(info.bit_depth, png::BitDepth::Eight);
+        assert_eq!(buf[0], 148, "8bit PQ code for 203 nits");
+        let chunks = parse_png_chunks(&out).unwrap();
+        assert!(chunks.iter().any(|c| c.typ == *b"cICP" && c.data == vec![9, 16, 0, 1]));
+        assert!(chunks.iter().any(|c| c.typ == *b"mDCv"), "static HDR metadata passes through");
     }
 
     // ---- Ultra HDR assembly tests ----

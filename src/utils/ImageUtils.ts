@@ -289,6 +289,33 @@ export async function buildBannerMask(previewDom: HTMLElement): Promise<BannerMa
   return { url, width, height, offX, offY, naturalWidth: img.naturalWidth, naturalHeight: img.naturalHeight }
 }
 
+// 探测 PNG 是否为 PQ 传输（cICP transfer 16；无 cICP 时以 mDCv/cLLi 静态 HDR 度量推断）
+export function pngIsPq(bytes: Uint8Array): boolean {
+  if (bytes.length < 8)
+    return false
+  const dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength)
+  let off = 8
+  let sawCicp = false
+  let cicpTransfer = 0
+  let sawStaticHdr = false
+  while (off + 12 <= bytes.length) {
+    const len = dv.getUint32(off)
+    const type = String.fromCharCode(bytes[off + 4], bytes[off + 5], bytes[off + 6], bytes[off + 7])
+    if (type === 'IDAT' || type === 'IEND')
+      break
+    const body = bytes.subarray(off + 8, off + 8 + len)
+    if (type === 'cICP' && len >= 2) {
+      sawCicp = true
+      cicpTransfer = body[1]
+      break
+    }
+    if (type === 'mDCv' || type === 'cLLi')
+      sawStaticHdr = true
+    off += 12 + len
+  }
+  return sawCicp ? cicpTransfer === 16 : sawStaticHdr
+}
+
 // PNG 高保真导出：WASM 原分辨率合成，保留位深与全部元数据 chunk；
 // 不适用（palette/APNG）或失败时返回 null，由调用方回退 canvas 路径
 export async function compositePngExport(previewDom: HTMLElement, file: File): Promise<Blob | null> {
@@ -301,10 +328,12 @@ export async function compositePngExport(previewDom: HTMLElement, file: File): P
 
     const bannerImg = await loadImage(mask.url)
     const wide = pngGuessWideGamut(bytes)
+    const pq = pngIsPq(bytes)
     const mc = document.createElement('canvas')
     mc.width = maskW
     mc.height = maskH
-    const mctx = wide
+    // PQ 源：mask 以 sRGB 渲染，WASM 侧做 sRGB→目标原色（BT.2020/P3）转换后再编码 PQ
+    const mctx = wide && !pq
       ? mc.getContext('2d', { colorSpace: 'display-p3' })
       : mc.getContext('2d')
     if (!mctx)
@@ -313,7 +342,7 @@ export async function compositePngExport(previewDom: HTMLElement, file: File): P
     const maskData = mctx.getImageData(0, 0, maskW, maskH).data
 
     const out = composite_png(bytes, new Uint8Array(maskData.buffer), maskW, maskH, offX, offY)
-    console.log('WASM PNG composite done:', `${naturalWidth}x${naturalHeight} -> out ${out.length}B, mask ${maskW}x${maskH}@(${offX},${offY}), wide=${wide}`)
+    console.log('WASM PNG composite done:', `${naturalWidth}x${naturalHeight} -> out ${out.length}B, mask ${maskW}x${maskH}@(${offX},${offY}), wide=${wide}, pq=${pq}`)
     return new Blob([out], { type: 'image/png' })
   }
   catch (e) {
