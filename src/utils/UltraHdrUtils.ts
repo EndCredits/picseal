@@ -1,6 +1,6 @@
 import type { BannerMask } from './ImageUtils'
 import { ultrahdr_assemble, ultrahdr_gainmap, ultrahdr_neutral } from '../wasm/gen_brand_photo_pictrue'
-import { buildBannerMask, createExportCanvas, loadImage } from './ImageUtils'
+import { buildBannerMask, createExportCanvas, jpegGuessWideGamut, loadImage } from './ImageUtils'
 import { embedExifRaw } from './JpegExifUtils'
 
 interface NeutralInfo {
@@ -72,7 +72,10 @@ export async function compositeUltraHdrExport(
     const gainMap = ultrahdr_gainmap(original)
 
     const bitmap = await createImageBitmap(file)
-    const canvas = createExportCanvas(W, H)
+    // base 画布色域跟随源文件（P3 源保持 P3，sRGB 源不再升 P3），
+    // 保证逐通道 gain map 在原色彩空间内应用
+    const wide = jpegGuessWideGamut(original)
+    const canvas = createExportCanvas(W, H, wide)
     const ctx = canvas.getContext('2d')
     if (!ctx) {
       bitmap.close()

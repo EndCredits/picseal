@@ -398,7 +398,7 @@ fn hdr_carry_segments(raw: &[u8], include_icc: bool) -> Vec<(u8, Vec<u8>)> {
     out
 }
 
-fn strip_mpf(raw: &[u8]) -> Vec<u8> {
+fn strip_app2(raw: &[u8], prefix: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(raw.len());
     if raw.len() < 2 {
         return raw.to_vec();
@@ -418,14 +418,22 @@ fn strip_mpf(raw: &[u8]) -> Vec<u8> {
             break;
         }
         let payload = &raw[off + 4..off + 2 + seg_len];
-        let is_mpf = marker == 0xE2 && payload.starts_with(b"MPF\0");
-        if !is_mpf {
+        let drop = marker == 0xE2 && payload.starts_with(prefix);
+        if !drop {
             out.extend_from_slice(&raw[off..off + 2 + seg_len]);
         }
         off += 2 + seg_len;
     }
     out.extend_from_slice(&raw[off..]);
     out
+}
+
+fn strip_mpf(raw: &[u8]) -> Vec<u8> {
+    strip_app2(raw, b"MPF\0")
+}
+
+fn strip_icc(raw: &[u8]) -> Vec<u8> {
+    strip_app2(raw, b"ICC_PROFILE\0")
 }
 
 fn gainmap_range(raw: &[u8]) -> Option<(usize, usize)> {
@@ -698,9 +706,22 @@ fn ultrahdr_assemble_inner(original: &[u8], base: &[u8], gainmap: &[u8]) -> Resu
     let orig_gm = &original[orig_gm_abs..orig_gm_abs + orig_gm_size];
 
     // Gain map carries its own metadata (ISO payload / ICC); re-attach it when
-    // the caller supplied a re-encoded gain map image
+    // the caller supplied a re-encoded gain map image. A re-encoded gain map may
+    // carry an encoder-added ICC (canvas sRGB) — replace it with the original
+    // so exactly one profile (the HDR intent one) survives.
+    let carry = hdr_carry_segments(orig_gm, true);
+    let orig_icc = carry
+        .iter()
+        .find(|(m, p)| *m == 0xE2 && p.starts_with(b"ICC_PROFILE\0"))
+        .map(|(_, p)| p.clone());
     let mut gm = gainmap.to_vec();
-    let gm_ins: Vec<(u8, Vec<u8>)> = hdr_carry_segments(orig_gm, true)
+    if let Some(icc) = &orig_icc {
+        let has_any_icc = jpeg_segments(&gm).iter().any(|s| s.marker == 0xE2 && s.payload.starts_with(b"ICC_PROFILE\0"));
+        if has_any_icc && !has_segment(&gm, 0xE2, icc) {
+            gm = strip_icc(&gm);
+        }
+    }
+    let gm_ins: Vec<(u8, Vec<u8>)> = carry
         .into_iter()
         .filter(|(m, p)| !has_segment(&gm, *m, p))
         .collect();
@@ -1715,6 +1736,40 @@ mod tests {
         let chunks = parse_png_chunks(&out).unwrap();
         assert!(chunks.iter().any(|c| c.typ == *b"cICP" && c.data == vec![9, 16, 0, 1]));
         assert!(chunks.iter().any(|c| c.typ == *b"mDCv"), "static HDR metadata passes through");
+    }
+
+    #[test]
+    fn ultrahdr_assemble_single_gainmap_icc() {
+        let Ok(src) = std::fs::read(GOOGLE_FIXTURE) else { eprintln!("SKIP: no google fixture"); return; };
+        let (gm_abs, gm_size) = gainmap_range(&src).unwrap();
+        let orig_gm = &src[gm_abs..gm_abs + gm_size];
+        let base = &src[..gm_abs];
+        let orig_icc = jpeg_segments(orig_gm)
+            .into_iter()
+            .find(|s| s.marker == 0xE2 && s.payload.starts_with(b"ICC_PROFILE\0"))
+            .map(|s| s.payload.to_vec())
+            .expect("fixture gain map should carry an ICC");
+        // simulate a canvas re-encode: the original profile is gone, the encoder
+        // attached its own (sRGB) profile instead
+        let mut reencoded = strip_icc(orig_gm);
+        let fake = [b"ICC_PROFILE\0\x01\x01".as_slice(), b"sRGB fake canvas profile"].concat();
+        let at = jpeg_app_insert_pos(&reencoded);
+        insert_segments(&mut reencoded, at, &[(0xE2, fake)]);
+        let count = |jpeg: &[u8]| {
+            jpeg_segments(jpeg).iter().filter(|s| s.marker == 0xE2 && s.payload.starts_with(b"ICC_PROFILE\0")).count()
+        };
+        assert_eq!(count(&reencoded), 1);
+
+        let out = ultrahdr_assemble_inner(&src, base, &reencoded).unwrap();
+        let (out_gm_abs, out_gm_size) = gainmap_range(&out).unwrap();
+        let out_gm = &out[out_gm_abs..out_gm_abs + out_gm_size];
+        assert_eq!(count(out_gm), 1, "exactly one ICC profile in the output gain map");
+        let out_icc = jpeg_segments(out_gm)
+            .into_iter()
+            .find(|s| s.marker == 0xE2 && s.payload.starts_with(b"ICC_PROFILE\0"))
+            .map(|s| s.payload.to_vec())
+            .unwrap();
+        assert_eq!(out_icc, orig_icc, "original HDR intent profile must survive");
     }
 
     // ---- Ultra HDR assembly tests ----

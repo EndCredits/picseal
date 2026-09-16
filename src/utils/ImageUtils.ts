@@ -168,19 +168,21 @@ export interface RasterizeOptions {
   style?: Partial<CSSStyleDeclaration>
 }
 
-// 创建导出画布：优先 Display P3 广色域，不支持时回退 sRGB（如 Firefox）
-export function createExportCanvas(width: number, height: number): HTMLCanvasElement {
+// 创建导出画布：wide 时优先 Display P3 广色域，不支持或非广色域源时回退 sRGB（如 Firefox）
+export function createExportCanvas(width: number, height: number, wide = true): HTMLCanvasElement {
   let canvas: HTMLCanvasElement | null = null
-  try {
-    const c = document.createElement('canvas')
-    c.width = width
-    c.height = height
-    const ctx = c.getContext('2d', { colorSpace: 'display-p3' })
-    if (ctx && ctx.getContextAttributes()?.colorSpace === 'display-p3')
-      canvas = c
-  }
-  catch {
-    canvas = null
+  if (wide) {
+    try {
+      const c = document.createElement('canvas')
+      c.width = width
+      c.height = height
+      const ctx = c.getContext('2d', { colorSpace: 'display-p3' })
+      if (ctx && ctx.getContextAttributes()?.colorSpace === 'display-p3')
+        canvas = c
+    }
+    catch {
+      canvas = null
+    }
   }
   if (!canvas) {
     canvas = document.createElement('canvas')
@@ -287,6 +289,42 @@ export async function buildBannerMask(previewDom: HTMLElement): Promise<BannerMa
     style: { transform: `scale(${scale})`, transformOrigin: 'top left' },
   })
   return { url, width, height, offX, offY, naturalWidth: img.naturalWidth, naturalHeight: img.naturalHeight }
+}
+
+// 从 JPEG APP2 ICC 段猜测是否广色域（与 pngGuessWideGamut 同款启发式；
+// 未知命名的 ICC 按广色域处理）
+export function jpegGuessWideGamut(bytes: Uint8Array): boolean {
+  if (bytes.length < 4 || bytes[0] !== 0xFF || bytes[1] !== 0xD8)
+    return false
+  let off = 2
+  let sawIcc = false
+  while (off + 4 <= bytes.length) {
+    if (bytes[off] !== 0xFF)
+      break
+    const marker = bytes[off + 1]
+    if (marker === 0xDA || marker === 0xD9)
+      break
+    const len = (bytes[off + 2] << 8) | bytes[off + 3]
+    if (len < 2 || off + 2 + len > bytes.length)
+      break
+    if (marker === 0xE2) {
+      const payload = bytes.subarray(off + 4, off + 2 + len)
+      if (payload.length > 14 && payload[0] === 0x49 && payload[1] === 0x43 && payload[2] === 0x43) {
+        sawIcc = true
+        const head = payload.subarray(0, Math.min(payload.length, 2048))
+        // profile 描述在 ICC v2 里是 ASCII、v4 里是 UTF-16BE，两种都扫一遍
+        const texts = [new TextDecoder('latin1').decode(head), new TextDecoder('utf-16be').decode(head)]
+        if (texts.some(t => /p3|2020|adobe|prophoto/i.test(t)))
+          return true
+        // 显式标注 sRGB 的 profile（如 "sRGB Gamut with sRGB Transfer"）判为非广色域；
+        // 顺序：P3 profile 的描述文本里也含 sRGB 字样，必须先判广色域关键词
+        if (texts.some(t => /srgb|iec61966/i.test(t)))
+          return false
+      }
+    }
+    off += 2 + len
+  }
+  return sawIcc
 }
 
 // 探测 PNG 是否为 PQ 传输（cICP transfer 16；无 cICP 时以 mDCv/cLLi 静态 HDR 度量推断）
