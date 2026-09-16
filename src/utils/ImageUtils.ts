@@ -327,10 +327,10 @@ export function jpegGuessWideGamut(bytes: Uint8Array): boolean {
   return sawIcc
 }
 
-// 探测 PNG 是否为 PQ 传输（cICP transfer 16；无 cICP 时以 mDCv/cLLi 静态 HDR 度量推断）
-export function pngIsPq(bytes: Uint8Array): boolean {
+// 探测 PNG 的 HDR 传输（cICP transfer 16=PQ / 18=HLG；无 cICP 时以 mDCv/cLLi 静态 HDR 度量按 PQ 处理）
+export function pngHdrTransfer(bytes: Uint8Array): 'pq' | 'hlg' | null {
   if (bytes.length < 8)
-    return false
+    return null
   const dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength)
   let off = 8
   let sawCicp = false
@@ -351,7 +351,9 @@ export function pngIsPq(bytes: Uint8Array): boolean {
       sawStaticHdr = true
     off += 12 + len
   }
-  return sawCicp ? cicpTransfer === 16 : sawStaticHdr
+  if (sawCicp)
+    return cicpTransfer === 16 ? 'pq' : cicpTransfer === 18 ? 'hlg' : null
+  return sawStaticHdr ? 'pq' : null
 }
 
 // PNG 高保真导出：WASM 原分辨率合成，保留位深与全部元数据 chunk；
@@ -366,12 +368,12 @@ export async function compositePngExport(previewDom: HTMLElement, file: File): P
 
     const bannerImg = await loadImage(mask.url)
     const wide = pngGuessWideGamut(bytes)
-    const pq = pngIsPq(bytes)
+    const hdr = pngHdrTransfer(bytes)
     const mc = document.createElement('canvas')
     mc.width = maskW
     mc.height = maskH
-    // PQ 源：mask 以 sRGB 渲染，WASM 侧做 sRGB→目标原色（BT.2020/P3）转换后再编码 PQ
-    const mctx = wide && !pq
+    // HDR 源：mask 以 sRGB 渲染，WASM 侧做 sRGB→目标原色（BT.2020/P3）转换后再编码 PQ/HLG
+    const mctx = wide && !hdr
       ? mc.getContext('2d', { colorSpace: 'display-p3' })
       : mc.getContext('2d')
     if (!mctx)
@@ -380,7 +382,7 @@ export async function compositePngExport(previewDom: HTMLElement, file: File): P
     const maskData = mctx.getImageData(0, 0, maskW, maskH).data
 
     const out = composite_png(bytes, new Uint8Array(maskData.buffer), maskW, maskH, offX, offY)
-    console.log('WASM PNG composite done:', `${naturalWidth}x${naturalHeight} -> out ${out.length}B, mask ${maskW}x${maskH}@(${offX},${offY}), wide=${wide}, pq=${pq}`)
+    console.log('WASM PNG composite done:', `${naturalWidth}x${naturalHeight} -> out ${out.length}B, mask ${maskW}x${maskH}@(${offX},${offY}), wide=${wide}, hdr=${hdr}`)
     return new Blob([out], { type: 'image/png' })
   }
   catch (e) {
