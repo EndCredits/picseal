@@ -169,7 +169,7 @@ export interface RasterizeOptions {
 }
 
 // 创建导出画布：优先 Display P3 广色域，不支持时回退 sRGB（如 Firefox）
-function createExportCanvas(width: number, height: number): HTMLCanvasElement {
+export function createExportCanvas(width: number, height: number): HTMLCanvasElement {
   let canvas: HTMLCanvasElement | null = null
   try {
     const c = document.createElement('canvas')
@@ -190,7 +190,7 @@ function createExportCanvas(width: number, height: number): HTMLCanvasElement {
   return canvas
 }
 
-function loadImage(uri: string): Promise<HTMLImageElement> {
+export function loadImage(uri: string): Promise<HTMLImageElement> {
   return new Promise((resolve, reject) => {
     const image = new Image()
     image.onload = () => resolve(image)
@@ -250,35 +250,53 @@ export function pngGuessWideGamut(bytes: Uint8Array): boolean {
   return sawIccp // 未知名称的 iCCP 按广色域处理（与 P3 预览一致）
 }
 
+// 横幅 DOM → 原生分辨率 PNG mask；几何与预览 DOM 完全一致（PNG/JPEG 导出共用）
+export interface BannerMask {
+  url: string
+  width: number
+  height: number
+  offX: number
+  offY: number
+  naturalWidth: number
+  naturalHeight: number
+}
+
+export async function buildBannerMask(previewDom: HTMLElement): Promise<BannerMask | null> {
+  const img = previewDom.querySelector('.preview-picture') as HTMLImageElement | null
+  const banner = previewDom.querySelector('.preview-info') as HTMLElement | null
+  if (!img || !banner || !img.naturalWidth || !img.naturalHeight)
+    return null
+  const imgRect = img.getBoundingClientRect()
+  const bannerRect = banner.getBoundingClientRect()
+  if (!imgRect.width || !bannerRect.width || !bannerRect.height)
+    return null
+  const scale = img.naturalWidth / imgRect.width
+  const width = Math.max(1, Math.round(bannerRect.width * scale))
+  const height = Math.max(1, Math.round(bannerRect.height * scale))
+  const offX = Math.round((bannerRect.left - imgRect.left) * scale)
+  const offY = Math.round((bannerRect.top - imgRect.top) * scale)
+  if (offX < 0 || offY < 0 || offX + width > img.naturalWidth)
+    return null
+  const url = await rasterizeDomToDataUrl(banner, {
+    format: 'png',
+    width,
+    height,
+    style: { transform: `scale(${scale})`, transformOrigin: 'top left' },
+  })
+  return { url, width, height, offX, offY, naturalWidth: img.naturalWidth, naturalHeight: img.naturalHeight }
+}
+
 // PNG 高保真导出：WASM 原分辨率合成，保留位深与全部元数据 chunk；
 // 不适用（palette/APNG）或失败时返回 null，由调用方回退 canvas 路径
 export async function compositePngExport(previewDom: HTMLElement, file: File): Promise<Blob | null> {
   try {
-    const img = previewDom.querySelector('.preview-picture') as HTMLImageElement | null
-    const banner = previewDom.querySelector('.preview-info') as HTMLElement | null
-    if (!img || !banner || !img.naturalWidth || !img.naturalHeight)
+    const mask = await buildBannerMask(previewDom)
+    if (!mask)
       return null
+    const { width: maskW, height: maskH, offX, offY, naturalWidth, naturalHeight } = mask
     const bytes = new Uint8Array(await file.arrayBuffer())
-    const imgRect = img.getBoundingClientRect()
-    const bannerRect = banner.getBoundingClientRect()
-    if (!imgRect.width || !bannerRect.width || !bannerRect.height)
-      return null
-    const scale = img.naturalWidth / imgRect.width
-    const maskW = Math.max(1, Math.round(bannerRect.width * scale))
-    const maskH = Math.max(1, Math.round(bannerRect.height * scale))
-    const offX = Math.round((bannerRect.left - imgRect.left) * scale)
-    const offY = Math.round((bannerRect.top - imgRect.top) * scale)
-    if (offX < 0 || offY < 0 || offX + maskW > img.naturalWidth)
-      return null
 
-    // 横幅 DOM → 原生分辨率 RGBA mask（色彩空间与源图一致，保证与预览观感相同）
-    const bannerUrl = await rasterizeDomToDataUrl(banner, {
-      format: 'png',
-      width: maskW,
-      height: maskH,
-      style: { transform: `scale(${scale})`, transformOrigin: 'top left' },
-    })
-    const bannerImg = await loadImage(bannerUrl)
+    const bannerImg = await loadImage(mask.url)
     const wide = pngGuessWideGamut(bytes)
     const mc = document.createElement('canvas')
     mc.width = maskW
@@ -292,7 +310,7 @@ export async function compositePngExport(previewDom: HTMLElement, file: File): P
     const maskData = mctx.getImageData(0, 0, maskW, maskH).data
 
     const out = composite_png(bytes, new Uint8Array(maskData.buffer), maskW, maskH, offX, offY)
-    console.log('WASM PNG composite done:', `${img.naturalWidth}x${img.naturalHeight} -> out ${out.length}B, mask ${maskW}x${maskH}@(${offX},${offY}), wide=${wide}`)
+    console.log('WASM PNG composite done:', `${naturalWidth}x${naturalHeight} -> out ${out.length}B, mask ${maskW}x${maskH}@(${offX},${offY}), wide=${wide}`)
     return new Blob([out], { type: 'image/png' })
   }
   catch (e) {

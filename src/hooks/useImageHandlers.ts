@@ -6,6 +6,7 @@ import { useRef, useState } from 'react'
 import { getBrandUrl } from '../utils/BrandUtils'
 import { compositePngExport, dataURLtoBlob, getRandomImage, parseExifData, rasterizeDomToDataUrl } from '../utils/ImageUtils'
 import { embedExifRaw, extractExifRaw } from '../utils/JpegExifUtils'
+import { compositeUltraHdrExport } from '../utils/UltraHdrUtils'
 import { detect_hdr, get_exif } from '../wasm/gen_brand_photo_pictrue'
 
 export function useImageHandlers(formRef: any, initialFormValue: ExifParamsForm) {
@@ -15,6 +16,7 @@ export function useImageHandlers(formRef: any, initialFormValue: ExifParamsForm)
   const [uploadImgType, setUploadImgType] = useState<string>()
   const [uploadFile, setUploadFile] = useState<RcFile | null>(null)
   const [exifBlob, setExifBlob] = useState<Blob | null>(null)
+  const [hdrGainMapJpeg, setHdrGainMapJpeg] = useState(false)
 
   // 探测浏览器能否解码该图片（Chrome/Firefox 不支持 HEIC）
   async function canDecode(blobUrl: string): Promise<boolean> {
@@ -50,7 +52,11 @@ export function useImageHandlers(formRef: any, initialFormValue: ExifParamsForm)
           return
         }
 
-        if (hdrInfo?.is_hdr)
+        const gainMapJpeg = !!hdrInfo?.is_hdr && hdrInfo.kind === 'jpeg-gainmap'
+        setHdrGainMapJpeg(gainMapJpeg)
+        if (gainMapJpeg)
+          message.info('检测到 HDR（gain map JPEG）：导出将保留 HDR，水印区域按 SDR 白处理', 300)
+        else if (hdrInfo?.is_hdr)
           message.warning('检测到 HDR 照片：导出后将丢失 HDR 信息，输出为 SDR', 300)
 
         const exifData = get_exif(bytes)
@@ -93,8 +99,14 @@ export function useImageHandlers(formRef: any, initialFormValue: ExifParamsForm)
       let downloadBlob: Blob | null = null
       let dataUrl = ''
 
+      // gain map JPEG：WASM Ultra HDR 组装（原生分辨率水印 + 保留 HDR）
+      if ((uploadImgType === 'image/jpeg' || uploadImgType === 'image/jpg') && hdrGainMapJpeg && uploadFile) {
+        console.log('wasm ultrahdr composite export')
+        downloadBlob = await compositeUltraHdrExport(previewDom, uploadFile, exifEnable, exifBlob)
+      }
+
       // PNG 输入优先走 WASM 高保真管线（原分辨率/位深/元数据保留）
-      if (uploadImgType === 'image/png' && uploadFile) {
+      if (!downloadBlob && uploadImgType === 'image/png' && uploadFile) {
         console.log('wasm png composite export')
         downloadBlob = await compositePngExport(previewDom, uploadFile)
       }

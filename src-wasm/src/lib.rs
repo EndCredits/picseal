@@ -299,6 +299,445 @@ pub fn detect_hdr(raw: Vec<u8>) -> JsValue {
     <wasm_bindgen::JsValue as JsValueSerdeExt>::from_serde(&info).unwrap()
 }
 
+// ---- Ultra HDR (MPF gain map JPEG) assembly ----
+// Keep the watermarked SDR base, re-attach the original gain map with its
+// metadata (XMP hdrgm / ISO 21496-1 APP2 / ICC), and rewrite the MPF directory.
+// Layout follows libultrahdr v1.4 output (verified against ultrahdr_app).
+
+const ISO21496_URN: &[u8] = b"urn:iso:std:iso:ts:21496:-1\0";
+const XMP_SIG: &[u8] = b"http://ns.adobe.com/xap/1.0/";
+const MPF_MARKER_LEN: usize = 90;
+
+struct JpegSegment<'a> {
+    marker: u8,
+    payload: &'a [u8],
+    start: usize,
+}
+
+fn jpeg_segments(raw: &[u8]) -> Vec<JpegSegment<'_>> {
+    let mut out = Vec::new();
+    if raw.len() < 4 || raw[0] != 0xFF || raw[1] != 0xD8 {
+        return out;
+    }
+    let mut off = 2usize;
+    while off + 4 <= raw.len() {
+        if raw[off] != 0xFF {
+            break;
+        }
+        let marker = raw[off + 1];
+        if marker == 0xDA || marker == 0xD9 {
+            break;
+        }
+        if marker == 0x01 || (0xD0..=0xD7).contains(&marker) {
+            off += 2;
+            continue;
+        }
+        let seg_len = u16::from_be_bytes([raw[off + 2], raw[off + 3]]) as usize;
+        if seg_len < 2 || off + 2 + seg_len > raw.len() {
+            break;
+        }
+        out.push(JpegSegment { marker, payload: &raw[off + 4..off + 2 + seg_len], start: off });
+        off += 2 + seg_len;
+    }
+    out
+}
+
+fn jpeg_app_insert_pos(raw: &[u8]) -> usize {
+    let mut off = 2usize;
+    while off + 4 <= raw.len() {
+        if raw[off] != 0xFF {
+            break;
+        }
+        let marker = raw[off + 1];
+        if !((0xE0..=0xEF).contains(&marker) || marker == 0xFE) {
+            break;
+        }
+        let seg_len = u16::from_be_bytes([raw[off + 2], raw[off + 3]]) as usize;
+        if seg_len < 2 || off + 2 + seg_len > raw.len() {
+            break;
+        }
+        off += 2 + seg_len;
+    }
+    off
+}
+
+fn write_jpeg_segment(out: &mut Vec<u8>, marker: u8, payload: &[u8]) {
+    if payload.len() + 2 > u16::MAX as usize {
+        return;
+    }
+    out.extend_from_slice(&[0xFF, marker]);
+    out.extend_from_slice(&((payload.len() + 2) as u16).to_be_bytes());
+    out.extend_from_slice(payload);
+}
+
+fn has_segment(raw: &[u8], marker: u8, payload: &[u8]) -> bool {
+    jpeg_segments(raw).iter().any(|s| s.marker == marker && s.payload == payload)
+}
+
+// HDR metadata segments: XMP carrying hdrgm, ISO 21496-1 APP2, optionally ICC
+fn hdr_carry_segments(raw: &[u8], include_icc: bool) -> Vec<(u8, Vec<u8>)> {
+    let mut out: Vec<(u8, Vec<u8>)> = Vec::new();
+    for s in jpeg_segments(raw) {
+        let is_hdr_meta = (s.marker == 0xE1 && s.payload.starts_with(XMP_SIG)
+            && (contains(s.payload, b"hdrgm:") || contains(s.payload, b"hdr-gain-map")))
+            || (s.marker == 0xE2 && s.payload.starts_with(ISO21496_URN))
+            || (include_icc && s.marker == 0xE2 && s.payload.starts_with(b"ICC_PROFILE\0"));
+        if !is_hdr_meta {
+            continue;
+        }
+        if s.payload.len() + 2 > u16::MAX as usize {
+            continue;
+        }
+        if !out.iter().any(|(m, p)| *m == s.marker && p.as_slice() == s.payload) {
+            out.push((s.marker, s.payload.to_vec()));
+        }
+    }
+    out
+}
+
+fn strip_mpf(raw: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(raw.len());
+    if raw.len() < 2 {
+        return raw.to_vec();
+    }
+    out.extend_from_slice(&raw[..2]);
+    let mut off = 2usize;
+    while off + 4 <= raw.len() {
+        if raw[off] != 0xFF {
+            break;
+        }
+        let marker = raw[off + 1];
+        if marker == 0xDA || marker == 0xD9 || marker == 0x01 || (0xD0..=0xD7).contains(&marker) {
+            break;
+        }
+        let seg_len = u16::from_be_bytes([raw[off + 2], raw[off + 3]]) as usize;
+        if seg_len < 2 || off + 2 + seg_len > raw.len() {
+            break;
+        }
+        let payload = &raw[off + 4..off + 2 + seg_len];
+        let is_mpf = marker == 0xE2 && payload.starts_with(b"MPF\0");
+        if !is_mpf {
+            out.extend_from_slice(&raw[off..off + 2 + seg_len]);
+        }
+        off += 2 + seg_len;
+    }
+    out.extend_from_slice(&raw[off..]);
+    out
+}
+
+fn gainmap_range(raw: &[u8]) -> Option<(usize, usize)> {
+    for s in jpeg_segments(raw) {
+        if s.marker != 0xE2 {
+            continue;
+        }
+        if let Some((img_off, img_size)) = mpf_second_image(s.payload) {
+            let abs = s.start + 8 + img_off;
+            if abs + 4 <= raw.len() && raw[abs] == 0xFF && raw[abs + 1] == 0xD8 {
+                let size = if img_size == 0 { raw.len() - abs } else { img_size.min(raw.len() - abs) };
+                return Some((abs, size));
+            }
+        }
+    }
+    None
+}
+
+fn ultrahdr_gainmap_inner(raw: &[u8]) -> Option<Vec<u8>> {
+    let (abs, size) = gainmap_range(raw)?;
+    Some(raw[abs..abs + size].to_vec())
+}
+
+// ISO 21496-1 APP2 body after the URN: version(4) + flags + per-channel
+// min/max/gamma/offsets as fractions (libultrahdr gainmapmetadata.cpp layout)
+fn iso_neutral_values(payload: &[u8]) -> Option<(bool, [u8; 3])> {
+    let data = payload.strip_prefix(ISO21496_URN)?;
+    if data.len() < 5 || u16::from_be_bytes([data[0], data[1]]) != 0 {
+        return None;
+    }
+    let flags = data[4];
+    if flags & 4 != 0 {
+        return None; // backward direction (HDR as base) is not supported
+    }
+    let multi = flags & 0x80 != 0;
+    let common = flags & 8 != 0;
+    let ch_count = if multi { 3usize } else { 1usize };
+    let mut pos = 5usize;
+    let u32at = |pos: &mut usize| -> Option<u32> {
+        let v = u32::from_be_bytes([*data.get(*pos)?, *data.get(*pos + 1)?, *data.get(*pos + 2)?, *data.get(*pos + 3)?]);
+        *pos += 4;
+        Some(v)
+    };
+    let s32at = |pos: &mut usize| -> Option<i32> {
+        let v = i32::from_be_bytes([*data.get(*pos)?, *data.get(*pos + 1)?, *data.get(*pos + 2)?, *data.get(*pos + 3)?]);
+        *pos += 4;
+        Some(v)
+    };
+    let mut channels: Vec<(f64, f64, f64)> = Vec::with_capacity(ch_count);
+    if common {
+        let den = u32at(&mut pos)?;
+        u32at(&mut pos)?;
+        u32at(&mut pos)?;
+        if den == 0 {
+            return None;
+        }
+        for _ in 0..ch_count {
+            let mn = s32at(&mut pos)? as f64 / den as f64;
+            let mx = s32at(&mut pos)? as f64 / den as f64;
+            let ga = u32at(&mut pos)? as f64 / den as f64;
+            s32at(&mut pos)?;
+            s32at(&mut pos)?;
+            channels.push((mn, mx, ga));
+        }
+    } else {
+        let _bh_n = u32at(&mut pos)?;
+        let bh_d = u32at(&mut pos)?;
+        let _ah_n = u32at(&mut pos)?;
+        let ah_d = u32at(&mut pos)?;
+        if bh_d == 0 || ah_d == 0 {
+            return None;
+        }
+        for _ in 0..ch_count {
+            let min_n = s32at(&mut pos)?;
+            let min_d = u32at(&mut pos)?;
+            let max_n = s32at(&mut pos)?;
+            let max_d = u32at(&mut pos)?;
+            let gamma_n = u32at(&mut pos)?;
+            let gamma_d = u32at(&mut pos)?;
+            let _ = (s32at(&mut pos)?, u32at(&mut pos)?);
+            let _ = (s32at(&mut pos)?, u32at(&mut pos)?);
+            if min_d == 0 || max_d == 0 || gamma_d == 0 {
+                return None;
+            }
+            channels.push((min_n as f64 / min_d as f64, max_n as f64 / max_d as f64, gamma_n as f64 / gamma_d as f64));
+        }
+    }
+    let mut values = [0u8; 3];
+    for (i, (mn, mx, ga)) in channels.iter().enumerate() {
+        values[if multi { i } else { 0 }] = neutral_value(*mn, *mx, *ga)?;
+    }
+    if !multi {
+        values[1] = values[0];
+        values[2] = values[0];
+    }
+    Some((multi, values))
+}
+
+// Minimal parse of hdrgm XMP attributes (single value or comma list)
+fn xmp_attr_floats(payload: &[u8], name: &str) -> Vec<f64> {
+    let needle = [b"hdrgm:", name.as_bytes()].concat();
+    let mut at = 0usize;
+    while let Some(i) = payload[at..].windows(needle.len()).position(|w| w == needle.as_slice()).map(|p| p + at) {
+        let mut j = i + needle.len();
+        while j < payload.len() && payload[j] == b' ' {
+            j += 1;
+        }
+        if j < payload.len() && payload[j] == b'=' {
+            j += 1;
+            while j < payload.len() && payload[j] == b' ' {
+                j += 1;
+            }
+            if j < payload.len() && (payload[j] == b'"' || payload[j] == b'\'') {
+                let quote = payload[j];
+                let start = j + 1;
+                let mut end = start;
+                while end < payload.len() && payload[end] != quote {
+                    end += 1;
+                }
+                let text = String::from_utf8_lossy(&payload[start..end]);
+                let vals: Vec<f64> = text
+                    .split([',', ' '])
+                    .filter(|t| !t.is_empty())
+                    .filter_map(|t| t.parse::<f64>().ok())
+                    .collect();
+                if !vals.is_empty() {
+                    return vals;
+                }
+            }
+        }
+        at = i + needle.len();
+    }
+    Vec::new()
+}
+
+// Encoded sample that reconstructs gain = 1 (log2 boost 0): the neutrality
+// point of the gain map; math from libultrahdr affineMapGain/applyGain
+fn neutral_value(min_log2: f64, max_log2: f64, gamma: f64) -> Option<u8> {
+    if !min_log2.is_finite() || !max_log2.is_finite() || !gamma.is_finite() || gamma <= 0.0 {
+        return None;
+    }
+    let span = max_log2 - min_log2;
+    if span.abs() < 1e-9 {
+        return None;
+    }
+    let g = -min_log2 / span;
+    if !(0.0..=1.0).contains(&g) {
+        return None;
+    }
+    let sample = g.powf(gamma);
+    let code = (sample * 255.0 + 0.5).floor().clamp(0.0, 255.0) as u8;
+    Some(code)
+}
+
+fn xmp_neutral_values(payload: &[u8]) -> Option<(bool, [u8; 3])> {
+    let maxs = xmp_attr_floats(payload, "GainMapMax");
+    if maxs.is_empty() {
+        return None;
+    }
+    let mins = xmp_attr_floats(payload, "GainMapMin");
+    let gammas = xmp_attr_floats(payload, "Gamma");
+    let count = maxs.len().min(3);
+    let mut values = [0u8; 3];
+    for i in 0..count {
+        let mn = mins.get(i).copied().unwrap_or_else(|| mins.first().copied().unwrap_or(0.0));
+        let mx = maxs[i];
+        let ga = gammas.get(i).copied().unwrap_or_else(|| gammas.first().copied().unwrap_or(1.0));
+        values[i] = neutral_value(mn, mx, ga)?;
+    }
+    if count == 1 {
+        values[1] = values[0];
+        values[2] = values[0];
+    }
+    Some((count > 1, values))
+}
+
+#[derive(Serialize)]
+struct NeutralInfo {
+    ok: bool,
+    multi_channel: bool,
+    values: [u8; 3],
+}
+
+fn ultrahdr_neutral_inner(raw: &[u8]) -> NeutralInfo {
+    let mut iso_payloads: Vec<&[u8]> = Vec::new();
+    let mut xmp_payloads: Vec<&[u8]> = Vec::new();
+    for s in jpeg_segments(raw) {
+        if s.marker == 0xE2 && s.payload.starts_with(ISO21496_URN) && s.payload.len() > 32 {
+            iso_payloads.push(s.payload);
+        }
+        if s.marker == 0xE1 && s.payload.starts_with(XMP_SIG) && contains(s.payload, b"hdrgm:") {
+            xmp_payloads.push(s.payload);
+        }
+    }
+    if let Some((abs, size)) = gainmap_range(raw) {
+        let gm = &raw[abs..abs + size];
+        for s in jpeg_segments(gm) {
+            if s.marker == 0xE2 && s.payload.starts_with(ISO21496_URN) && s.payload.len() > 32 {
+                iso_payloads.push(s.payload);
+            }
+            if s.marker == 0xE1 && s.payload.starts_with(XMP_SIG) && contains(s.payload, b"hdrgm:") {
+                xmp_payloads.push(s.payload);
+            }
+        }
+    }
+    for payload in iso_payloads {
+        if let Some((multi, values)) = iso_neutral_values(payload) {
+            return NeutralInfo { ok: true, multi_channel: multi, values };
+        }
+    }
+    for payload in xmp_payloads {
+        if let Some((multi, values)) = xmp_neutral_values(payload) {
+            return NeutralInfo { ok: true, multi_channel: multi, values };
+        }
+    }
+    NeutralInfo { ok: false, multi_channel: false, values: [0; 3] }
+}
+
+fn build_mpf_segment(base_total_len: usize, gm_len: usize, gm_offset: usize) -> Vec<u8> {
+    let mut out = Vec::with_capacity(MPF_MARKER_LEN);
+    out.extend_from_slice(&[0xFF, 0xE2, 0x00, 0x58]);
+    out.extend_from_slice(b"MPF\0");
+    out.extend_from_slice(b"MM\x00\x2A\x00\x00\x00\x08");
+    out.extend_from_slice(&3u16.to_be_bytes());
+    out.extend_from_slice(&0xB000u16.to_be_bytes());
+    out.extend_from_slice(&7u16.to_be_bytes());
+    out.extend_from_slice(&4u32.to_be_bytes());
+    out.extend_from_slice(b"0100");
+    out.extend_from_slice(&0xB001u16.to_be_bytes());
+    out.extend_from_slice(&4u16.to_be_bytes());
+    out.extend_from_slice(&1u32.to_be_bytes());
+    out.extend_from_slice(&2u32.to_be_bytes());
+    out.extend_from_slice(&0xB002u16.to_be_bytes());
+    out.extend_from_slice(&7u16.to_be_bytes());
+    out.extend_from_slice(&32u32.to_be_bytes());
+    out.extend_from_slice(&50u32.to_be_bytes());
+    out.extend_from_slice(&0u32.to_be_bytes());
+    out.extend_from_slice(&0x00030000u32.to_be_bytes());
+    out.extend_from_slice(&(base_total_len as u32).to_be_bytes());
+    out.extend_from_slice(&0u32.to_be_bytes());
+    out.extend_from_slice(&0u16.to_be_bytes());
+    out.extend_from_slice(&0u16.to_be_bytes());
+    out.extend_from_slice(&0u32.to_be_bytes());
+    out.extend_from_slice(&(gm_len as u32).to_be_bytes());
+    out.extend_from_slice(&(gm_offset as u32).to_be_bytes());
+    out.extend_from_slice(&0u16.to_be_bytes());
+    out.extend_from_slice(&0u16.to_be_bytes());
+    out
+}
+
+fn insert_segments(raw: &mut Vec<u8>, at: usize, segs: &[(u8, Vec<u8>)]) {
+    if segs.is_empty() {
+        return;
+    }
+    let mut buf = Vec::new();
+    for (marker, payload) in segs {
+        write_jpeg_segment(&mut buf, *marker, payload);
+    }
+    raw.splice(at..at, buf);
+}
+
+fn ultrahdr_assemble_inner(original: &[u8], base: &[u8], gainmap: &[u8]) -> Result<Vec<u8>, String> {
+    if base.len() < 4 || base[0] != 0xFF || base[1] != 0xD8 {
+        return Err("base is not a JPEG".to_string());
+    }
+    if gainmap.len() < 4 || gainmap[0] != 0xFF || gainmap[1] != 0xD8 {
+        return Err("gain map is not a JPEG".to_string());
+    }
+    let (orig_gm_abs, orig_gm_size) = gainmap_range(original).ok_or("original has no MPF gain map")?;
+    let orig_gm = &original[orig_gm_abs..orig_gm_abs + orig_gm_size];
+
+    // Gain map carries its own metadata (ISO payload / ICC); re-attach it when
+    // the caller supplied a re-encoded gain map image
+    let mut gm = gainmap.to_vec();
+    let gm_ins: Vec<(u8, Vec<u8>)> = hdr_carry_segments(orig_gm, true)
+        .into_iter()
+        .filter(|(m, p)| !has_segment(&gm, *m, p))
+        .collect();
+    let gm_at = jpeg_app_insert_pos(&gm);
+    insert_segments(&mut gm, gm_at, &gm_ins);
+
+    // Base carries the XMP / ISO marker; strip any stale MPF before re-adding
+    let mut out = strip_mpf(base);
+    let base_ins: Vec<(u8, Vec<u8>)> = hdr_carry_segments(original, false)
+        .into_iter()
+        .filter(|(m, p)| !has_segment(&out, *m, p))
+        .collect();
+    let base_at = jpeg_app_insert_pos(&out);
+    insert_segments(&mut out, base_at, &base_ins);
+
+    let mpf_at = jpeg_app_insert_pos(&out);
+    let base_total_len = out.len() + MPF_MARKER_LEN;
+    let gm_offset = base_total_len - (mpf_at + 8);
+    let mpf = build_mpf_segment(base_total_len, gm.len(), gm_offset);
+    out.splice(mpf_at..mpf_at, mpf);
+    out.extend_from_slice(&gm);
+    Ok(out)
+}
+
+#[wasm_bindgen]
+pub fn ultrahdr_gainmap(raw: Vec<u8>) -> Result<Vec<u8>, JsValue> {
+    ultrahdr_gainmap_inner(&raw).ok_or_else(|| JsValue::from_str("no MPF gain map found"))
+}
+
+#[wasm_bindgen]
+pub fn ultrahdr_neutral(raw: Vec<u8>) -> JsValue {
+    let info = ultrahdr_neutral_inner(&raw);
+    <wasm_bindgen::JsValue as JsValueSerdeExt>::from_serde(&info).unwrap()
+}
+
+#[wasm_bindgen]
+pub fn ultrahdr_assemble(original: Vec<u8>, base: Vec<u8>, gainmap: Vec<u8>) -> Result<Vec<u8>, JsValue> {
+    ultrahdr_assemble_inner(&original, &base, &gainmap).map_err(|e| JsValue::from_str(&e))
+}
+
 // ---- PNG high-fidelity compositing ----
 // Decode at native bit depth, blend an RGBA watermark mask in the source's
 // gamma domain (identical math to CSS/canvas alpha compositing), re-encode at
@@ -991,5 +1430,116 @@ mod tests {
         if ran == 0 {
             eprintln!("SKIP: no local samples in test_pictures/");
         }
+    }
+
+    // ---- Ultra HDR assembly tests ----
+
+    const GOOGLE_FIXTURE: &str = "../test_pictures/google_ultrahdr.jpg";
+    const SYNTHETIC_FIXTURE: &str = "../test_pictures/synthetic-ultrahdr.jpg";
+
+    fn jpeg_with_xmp(xmp: &str) -> Vec<u8> {
+        let mut v = vec![0xFF, 0xD8, 0xFF, 0xE1];
+        let payload_len = XMP_SIG.len() + 1 + xmp.len();
+        v.extend_from_slice(&((payload_len + 2) as u16).to_be_bytes());
+        v.extend_from_slice(XMP_SIG);
+        v.push(0);
+        v.extend_from_slice(xmp.as_bytes());
+        v.extend_from_slice(&[0xFF, 0xDA, 0x00, 0x02]);
+        v
+    }
+
+    fn insert_com(jpeg: &mut Vec<u8>, text: &[u8]) {
+        let mut seg = vec![0xFF, 0xFE];
+        seg.extend_from_slice(&((text.len() + 2) as u16).to_be_bytes());
+        seg.extend_from_slice(text);
+        jpeg.splice(2..2, seg);
+    }
+
+    #[test]
+    fn ultrahdr_gainmap_extracts_second_image() {
+        let Ok(src) = std::fs::read(GOOGLE_FIXTURE) else { eprintln!("SKIP: no google fixture"); return; };
+        let gm = ultrahdr_gainmap_inner(&src).unwrap();
+        assert_eq!(gm.len(), 50006);
+        assert_eq!(&gm[..2], &[0xFF, 0xD8]);
+        assert_eq!(&gm[gm.len() - 2..], &[0xFF, 0xD9]);
+        // truncation safety
+        for cut in [0usize, 1, 7, 20, 100, 2000, src.len() / 2, src.len() - 1] {
+            let _ = ultrahdr_gainmap_inner(&src[..cut]);
+            let _ = ultrahdr_neutral_inner(&src[..cut]);
+        }
+    }
+
+    #[test]
+    fn iso_neutral_matches_libultrahdr_metadata() {
+        let Ok(src) = std::fs::read(GOOGLE_FIXTURE) else { eprintln!("SKIP: no google fixture"); return; };
+        let info = ultrahdr_neutral_inner(&src);
+        assert!(info.ok);
+        assert!(info.multi_channel);
+        assert_eq!(info.values, [171, 119, 146]);
+    }
+
+    #[test]
+    fn xmp_neutral_parsing() {
+        let xmp = "<x:xmpmeta><rdf:Description xmlns:hdrgm='http://ns.adobe.com/hdr-gain-map/1.0/' hdrgm:GainMapMax='2.5' hdrgm:GainMapMin='0' hdrgm:Gamma='1'/></x:xmpmeta>";
+        let info = ultrahdr_neutral_inner(&jpeg_with_xmp(xmp));
+        assert!(info.ok && !info.multi_channel);
+        assert_eq!(info.values, [0, 0, 0]);
+
+        let info = ultrahdr_neutral_inner(&jpeg_with_xmp("<hdrgm:GainMapMin=\"-1\" hdrgm:GainMapMax=\"1\" hdrgm:Gamma=\"1\"/>"));
+        assert!(info.ok && info.values[0] == 128);
+
+        let info = ultrahdr_neutral_inner(&jpeg_with_xmp("<hdrgm:GainMapMin=\"-1\" hdrgm:GainMapMax=\"1\" hdrgm:Gamma=\"2\"/>"));
+        assert!(info.ok && info.values[0] == 64);
+
+        let Ok(src) = std::fs::read(SYNTHETIC_FIXTURE) else { eprintln!("SKIP: no synthetic fixture"); return; };
+        let info = ultrahdr_neutral_inner(&src);
+        assert!(info.ok && !info.multi_channel);
+        assert_eq!(info.values[0], 0);
+    }
+
+    #[test]
+    fn ultrahdr_assemble_structure_roundtrip() {
+        let Ok(src) = std::fs::read(GOOGLE_FIXTURE) else { eprintln!("SKIP: no google fixture"); return; };
+        let (gm_abs, gm_size) = gainmap_range(&src).unwrap();
+        let gm = &src[gm_abs..gm_abs + gm_size];
+        let base = &src[..gm_abs];
+        let old_mpf: usize = jpeg_segments(base)
+            .iter()
+            .filter(|s| s.marker == 0xE2 && s.payload.starts_with(b"MPF\0"))
+            .map(|s| s.payload.len() + 4)
+            .sum();
+        assert_eq!(old_mpf, MPF_MARKER_LEN);
+
+        let out = ultrahdr_assemble_inner(&src, base, gm).unwrap();
+        assert_eq!(out.len(), base.len() - old_mpf + MPF_MARKER_LEN + gm.len());
+        let info = detect_hdr_inner(&out);
+        assert!(info.is_hdr && info.kind == "jpeg-gainmap");
+        assert_eq!(ultrahdr_gainmap_inner(&out).unwrap(), gm.to_vec());
+        let mpf = jpeg_segments(&out).into_iter().find(|s| s.marker == 0xE2 && s.payload.starts_with(b"MPF\0")).unwrap();
+        let (off, size) = mpf_second_image(mpf.payload).unwrap();
+        assert_eq!(size, gm.len());
+        assert_eq!(mpf.start + 8 + off, out.len() - gm.len());
+    }
+
+    #[test]
+    fn ultrahdr_assemble_modified_base_writes_fixture() {
+        let Ok(src) = std::fs::read(GOOGLE_FIXTURE) else { eprintln!("SKIP: no google fixture"); return; };
+        let (gm_abs, gm_size) = gainmap_range(&src).unwrap();
+        let gm = &src[gm_abs..gm_abs + gm_size];
+        let mut base = src[..gm_abs].to_vec();
+        insert_com(&mut base, b"picseal ultrahdr assemble test");
+        let out = ultrahdr_assemble_inner(&src, &base, gm).unwrap();
+        let path = std::env::temp_dir().join("picseal_ultrahdr_assembled.jpg");
+        std::fs::write(&path, &out).unwrap();
+        eprintln!("WROTE {}", path.display());
+        assert!(detect_hdr_inner(&out).is_hdr);
+        assert_eq!(ultrahdr_gainmap_inner(&out).unwrap(), gm.to_vec());
+    }
+
+    #[test]
+    fn ultrahdr_assemble_rejects_bad_input() {
+        assert!(ultrahdr_assemble_inner(&[], &[], &[]).is_err());
+        let jpeg = jpeg_with_xmp("<x/>");
+        assert!(ultrahdr_assemble_inner(&jpeg, &jpeg, &jpeg).is_err());
     }
 }
