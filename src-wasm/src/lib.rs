@@ -770,12 +770,12 @@ pub fn ultrahdr_assemble(original: Vec<u8>, base: Vec<u8>, gainmap: Vec<u8>) -> 
 
 const PNG_SIG: [u8; 8] = [0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
 
-struct PngChunk {
+struct PngChunk<'a> {
     typ: [u8; 4],
-    data: Vec<u8>,
+    data: &'a [u8],
 }
 
-fn parse_png_chunks(data: &[u8]) -> Result<Vec<PngChunk>, String> {
+fn parse_png_chunks(data: &[u8]) -> Result<Vec<PngChunk<'_>>, String> {
     if data.len() < 8 || data[..8] != PNG_SIG {
         return Err("not a PNG".to_string());
     }
@@ -790,7 +790,7 @@ fn parse_png_chunks(data: &[u8]) -> Result<Vec<PngChunk>, String> {
         if off + 12 + len > data.len() {
             return Err("truncated PNG chunk".to_string());
         }
-        chunks.push(PngChunk { typ, data: data[off + 8..off + 8 + len].to_vec() });
+        chunks.push(PngChunk { typ, data: &data[off + 8..off + 8 + len] });
         off += 12 + len;
         if typ == *b"IEND" {
             break;
@@ -973,11 +973,11 @@ fn sanitized_for_decode(original: &[u8], chunks: &[PngChunk]) -> Option<Vec<u8>>
     out.extend_from_slice(&PNG_SIG);
     for c in chunks {
         if c.typ == *b"cICP" && c.data.len() >= 3 && c.data[2] != 0 {
-            let mut data = c.data.clone();
+            let mut data = c.data.to_vec();
             data[2] = 0;
             write_chunk(&mut out, &c.typ, &data);
         } else {
-            write_chunk(&mut out, &c.typ, &c.data);
+            write_chunk(&mut out, &c.typ, c.data);
         }
     }
     Some(out)
@@ -1004,18 +1004,19 @@ fn png_composite(
         return Err("APNG not supported".to_string());
     }
 
-    // Decode at native bit depth (EXPAND: tRNS→alpha, <8bit gray→8bit)
+    // Decode at native bit depth (EXPAND: tRNS→alpha, <8bit gray→8bit).
+    // Decode straight into the final canvas buffer: extension rows are filled
+    // beforehand, so no separate decode buffer + copy is needed.
     let decode_owned = sanitized_for_decode(original, &chunks);
     let decode_src: &[u8] = decode_owned.as_deref().unwrap_or(original);
     let mut decoder = png::Decoder::new(std::io::Cursor::new(decode_src));
     decoder.set_transformations(png::Transformations::EXPAND);
     let mut reader = decoder.read_info().map_err(|e| format!("decode: {e}"))?;
-    let mut buf = vec![0u8; reader.output_buffer_size().ok_or_else(|| "bad PNG geometry".to_string())?];
-    let info = reader.next_frame(&mut buf).map_err(|e| format!("decode: {e}"))?;
-    buf.truncate(info.buffer_size());
-    let (w, h) = (info.width as usize, info.height as usize);
-    let sixteen = info.bit_depth == png::BitDepth::Sixteen;
-    let channels = info.color_type.samples() as usize;
+    let frame_bytes = reader.output_buffer_size().ok_or_else(|| "bad PNG geometry".to_string())?;
+    let (out_ct, out_depth) = reader.output_color_type();
+    let (w, h) = (reader.info().width as usize, reader.info().height as usize);
+    let sixteen = out_depth == png::BitDepth::Sixteen;
+    let channels = out_ct.samples();
     let bps = channels * if sixteen { 2 } else { 1 };
 
     if mask.len() < mask_w * mask_h * 4 {
@@ -1050,15 +1051,17 @@ fn png_composite(
                 }
             }
         }
-        let mut ext = Vec::with_capacity(out_h * row_bytes);
-        ext.extend_from_slice(&buf);
+        let mut c = Vec::with_capacity(out_h * row_bytes);
+        c.resize(h * row_bytes, 0);
         for _ in h..out_h {
-            ext.extend_from_slice(&row);
+            c.extend_from_slice(&row);
         }
-        ext
+        c
     } else {
-        buf
+        vec![0u8; frame_bytes]
     };
+    let info = reader.next_frame(&mut canvas[..frame_bytes]).map_err(|e| format!("decode: {e}"))?;
+    debug_assert_eq!(info.buffer_size(), frame_bytes);
 
     // Blend mask (RGBA8) into canvas, gamma-domain alpha compositing
     for my in 0..mask_h {
@@ -1095,22 +1098,28 @@ fn png_composite(
     }
 
     // Re-encode (height may be extended; color type/depth preserved)
-    let mut encoded: Vec<u8> = Vec::new();
+    // Re-encode (height may be extended; color type/depth preserved).
+    // Streaming writer filters row by row: avoids a second full-image buffer.
+    let mut encoded: Vec<u8> = Vec::with_capacity(canvas.len() * 3 / 4);
     {
+        use std::io::Write as _;
         let mut encoder = png::Encoder::new(&mut encoded, info.width, out_h as u32);
         encoder.set_color(info.color_type);
         encoder.set_depth(info.bit_depth);
         encoder.set_compression(png::Compression::Fast);
         let mut writer = encoder.write_header().map_err(|e| format!("encode: {e}"))?;
-        writer.write_image_data(&canvas).map_err(|e| format!("encode: {e}"))?;
+        let mut stream = writer.stream_writer().map_err(|e| format!("encode: {e}"))?;
+        stream.write_all(&canvas).map_err(|e| format!("encode: {e}"))?;
+        stream.finish().map_err(|e| format!("encode: {e}"))?;
     }
+    drop(canvas);
     let enc_chunks = parse_png_chunks(&encoded)?;
 
     // Assemble: sig + encoder IHDR (authoritative: geometry/interlace) + passthrough ancillary + IDAT* + IEND
     let enc_ihdr = enc_chunks.iter().find(|c| c.typ == *b"IHDR").ok_or("encoder produced no IHDR")?;
     let mut out = Vec::with_capacity(original.len() / 2 + encoded.len());
     out.extend_from_slice(&PNG_SIG);
-    write_chunk(&mut out, b"IHDR", &enc_ihdr.data);
+    write_chunk(&mut out, b"IHDR", enc_ihdr.data);
     // tRNS 仅在输出带 alpha 通道（ct 4/6）时丢弃，否则原样透传（色键对重编码像素仍有效）
     let has_alpha_out = enc_ihdr.data[9] == 4 || enc_ihdr.data[9] == 6;
     let skip: [&[u8; 4]; 7] = [b"IHDR", b"PLTE", b"IDAT", b"IEND", b"acTL", b"fcTL", b"fdAT"];
@@ -1124,17 +1133,19 @@ fn png_composite(
         // matrix_coefficients is meaningless for RGB PNG and must be 0 per spec;
         // normalize so the output stays decodable (same as sanitized_for_decode)
         if c.typ == *b"cICP" && c.data.len() >= 3 && c.data[2] != 0 {
-            let mut data = c.data.clone();
+            let mut data = c.data.to_vec();
             data[2] = 0;
             write_chunk(&mut out, &c.typ, &data);
             continue;
         }
-        write_chunk(&mut out, &c.typ, &c.data);
+        write_chunk(&mut out, &c.typ, c.data);
     }
     for c in enc_chunks.iter().filter(|c| c.typ == *b"IDAT") {
-        write_chunk(&mut out, b"IDAT", &c.data);
+        write_chunk(&mut out, b"IDAT", c.data);
     }
     write_chunk(&mut out, b"IEND", &[]);
+    drop(enc_chunks);
+    drop(encoded);
     Ok(out)
 }
 
@@ -1674,7 +1685,7 @@ mod tests {
         let mut out = Vec::new();
         out.extend_from_slice(&PNG_SIG);
         for c in &chunks {
-            write_chunk(&mut out, &c.typ, &c.data);
+            write_chunk(&mut out, &c.typ, c.data);
             if c.typ == *b"IHDR" {
                 write_chunk(&mut out, b"cICP", &data);
             }
@@ -1731,7 +1742,7 @@ mod tests {
         assert_eq!(ch(0, 0, 0), 38055, "opaque white → 203nit PQ code");
         assert_eq!((ch(1, 0, 0), ch(1, 0, 1), ch(1, 0, 2)), (17568, 10808, 7290), "alpha blend uses sRGB→BT.2020 mapped codes");
         assert_eq!(ch(1, 1, 0), 100, "untouched pixel unchanged");
-        assert!(parse_png_chunks(&out).unwrap().iter().any(|c| c.typ == *b"cICP" && c.data == vec![9, 16, 0, 1]), "cICP matrix normalized to 0");
+        assert!(parse_png_chunks(&out).unwrap().iter().any(|c| c.typ == *b"cICP" && c.data == [9, 16, 0, 1]), "cICP matrix normalized to 0");
     }
 
     #[test]
@@ -1763,7 +1774,7 @@ mod tests {
         assert_eq!(ch(0, 0, 0), 49151, "opaque white → 75% HLG signal");
         assert_eq!((ch(1, 0, 0), ch(1, 0, 1), ch(1, 0, 2)), (21626, 7760, 3806), "alpha blend uses sRGB→BT.2020 mapped codes");
         assert_eq!(ch(1, 1, 0), 100, "untouched pixel unchanged");
-        assert!(parse_png_chunks(&out).unwrap().iter().any(|c| c.typ == *b"cICP" && c.data == vec![9, 18, 0, 1]), "cICP matrix normalized to 0");
+        assert!(parse_png_chunks(&out).unwrap().iter().any(|c| c.typ == *b"cICP" && c.data == [9, 18, 0, 1]), "cICP matrix normalized to 0");
     }
 
     #[test]
@@ -1831,7 +1842,7 @@ mod tests {
         assert_eq!(info.bit_depth, png::BitDepth::Eight);
         assert_eq!(buf[0], 148, "8bit PQ code for 203 nits");
         let chunks = parse_png_chunks(&out).unwrap();
-        assert!(chunks.iter().any(|c| c.typ == *b"cICP" && c.data == vec![9, 16, 0, 1]));
+        assert!(chunks.iter().any(|c| c.typ == *b"cICP" && c.data == [9, 16, 0, 1]));
         assert!(chunks.iter().any(|c| c.typ == *b"mDCv"), "static HDR metadata passes through");
     }
 
