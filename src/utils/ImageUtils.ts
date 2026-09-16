@@ -266,6 +266,9 @@ export async function buildBannerMask(previewDom: HTMLElement): Promise<BannerMa
   const banner = previewDom.querySelector('.preview-info') as HTMLElement | null
   if (!img || !banner || !img.naturalWidth || !img.naturalHeight)
     return null
+  // 预览图切换有 0.6s 缩放过渡；过渡中 getBoundingClientRect 含 transform，几何会失真
+  if (Math.abs(img.getBoundingClientRect().width - img.clientWidth) > 0.5)
+    await delay(700)
   const imgRect = img.getBoundingClientRect()
   const bannerRect = banner.getBoundingClientRect()
   if (!imgRect.width || !bannerRect.width || !bannerRect.height)
