@@ -44,11 +44,11 @@ export function useImageHandlers(formRef: any, initialFormValue: ExifParamsForm)
         if (!await canDecode(blobUrl)) {
           URL.revokeObjectURL(blobUrl)
           if (hdrInfo?.is_hdr)
-            message.warning('当前浏览器无法解码该 HDR 图片，请使用 Safari 打开，或先转换为 SDR 的 JPEG/PNG 再上传', 300)
+            message.warning('当前浏览器无法解码该 HDR 图片，请使用 Safari 打开，或先转换为 SDR 的 JPEG/PNG 再上传', 5)
           else if (/heic|heif/i.test(file.type))
-            message.warning('当前浏览器不支持 HEIC，请使用 Safari 打开，或先转换为 JPEG/PNG 再上传', 300)
+            message.warning('当前浏览器不支持 HEIC，请使用 Safari 打开，或先转换为 JPEG/PNG 再上传', 5)
           else
-            message.warning('当前浏览器无法解码该图片格式，请换一张照片', 300)
+            message.warning('当前浏览器无法解码该图片格式，请换一张照片', 5)
           return
         }
 
@@ -56,13 +56,13 @@ export function useImageHandlers(formRef: any, initialFormValue: ExifParamsForm)
         const hdrPng = !!hdrInfo?.is_hdr && file.type === 'image/png' && hdrInfo.kind.startsWith('png-')
         setHdrGainMapJpeg(gainMapJpeg)
         if (gainMapJpeg)
-          message.info('检测到 HDR（gain map JPEG）：导出将保留 HDR，水印区域按 SDR 白处理', 300)
+          message.info('检测到 HDR（gain map JPEG）：导出将保留 HDR，水印区域按 SDR 白处理', 5)
         else if (hdrPng && hdrInfo.kind !== 'png-hlg')
-          message.info('检测到 HDR PNG（PQ）：导出保留 HDR，水印按 203nit / 目标原色映射', 300)
+          message.info('检测到 HDR PNG（PQ）：导出保留 HDR，水印按 203nit / 目标原色映射', 5)
         else if (hdrPng)
-          message.info('检测到 HDR PNG（HLG）：导出保留 HDR，水印按 BT.2408 参考白（75% 信号）映射', 300)
+          message.info('检测到 HDR PNG（HLG）：导出保留 HDR，水印按 BT.2408 参考白（75% 信号）映射', 5)
         else if (hdrInfo?.is_hdr)
-          message.warning('检测到 HDR 照片：导出后将丢失 HDR 信息，输出为 SDR', 300)
+          message.warning('检测到 HDR 照片：导出后将丢失 HDR 信息，输出为 SDR', 5)
 
         const exifData = get_exif(bytes)
         const parsedExif = parseExifData(exifData)
@@ -88,7 +88,7 @@ export function useImageHandlers(formRef: any, initialFormValue: ExifParamsForm)
       }
       catch (error) {
         console.error('Error parsing EXIF data:', error)
-        message.error('无法识别照片特定数据，请换一张照片', 300)
+        message.error('无法识别照片特定数据，请换一张照片', 5)
       }
     }
     load()
