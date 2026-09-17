@@ -1,9 +1,11 @@
 import type { RcFile } from 'antd/es/upload'
 
 import type { ExifParamsForm } from '../types'
+import type { AppleHdrInfo } from '../utils/AppleHdrUtils'
 import type { HeicDecodeResult } from '../utils/HeicUtils'
 import { message } from 'antd'
 import { useRef, useState } from 'react'
+import { appleHdrExport, probeAppleHdr } from '../utils/AppleHdrUtils'
 import { getBrandUrl } from '../utils/BrandUtils'
 import { decodeHeicToJpeg } from '../utils/HeicUtils'
 import { compositePngExport, dataURLtoBlob, getRandomImage, parseExifData, rasterizeDomToDataUrl } from '../utils/ImageUtils'
@@ -19,6 +21,7 @@ export function useImageHandlers(formRef: any, initialFormValue: ExifParamsForm)
   const [uploadFile, setUploadFile] = useState<RcFile | null>(null)
   const [exifBlob, setExifBlob] = useState<Blob | null>(null)
   const [hdrGainMapJpeg, setHdrGainMapJpeg] = useState(false)
+  const [appleHdr, setAppleHdr] = useState<AppleHdrInfo | null>(null)
 
   // 探测浏览器能否解码该图片（Chrome/Firefox 不支持 HEIC）
   async function canDecode(blobUrl: string): Promise<boolean> {
@@ -45,8 +48,10 @@ export function useImageHandlers(formRef: any, initialFormValue: ExifParamsForm)
         let blobUrl = URL.createObjectURL(file)
         let previewType = file.type
         let wasmDecodedHeic: HeicDecodeResult | null = null
+        const isHeic = /heic|heif/i.test(file.type) || /\.(?:heic|heif)$/i.test(file.name)
+        const appleInfo = isHeic ? probeAppleHdr(bytes) : null
+        setAppleHdr(appleInfo)
         if (!await canDecode(blobUrl)) {
-          const isHeic = /heic|heif/i.test(file.type) || /\.(?:heic|heif)$/i.test(file.name)
           // 非 WebKit 浏览器：懒加载 libheif wasm 解 HEIC（SDR），保留预览/导出可用
           wasmDecodedHeic = isHeic ? await decodeHeicToJpeg(file) : null
           if (!wasmDecodedHeic) {
@@ -68,7 +73,9 @@ export function useImageHandlers(formRef: any, initialFormValue: ExifParamsForm)
         const hdrPng = !!hdrInfo?.is_hdr && file.type === 'image/png' && hdrInfo.kind.startsWith('png-')
         setHdrGainMapJpeg(gainMapJpeg)
         if (wasmDecodedHeic)
-          message.info(`当前浏览器不支持 HEIC，已用内置解码器转为 SDR 预览（${wasmDecodedHeic.width}×${wasmDecodedHeic.height}，${wasmDecodedHeic.ms}ms）${hdrInfo?.is_hdr ? '；导出将丢失 HDR' : ''}`, 5)
+          message.info(`当前浏览器不支持 HEIC，已用内置解码器转为 SDR 预览（${wasmDecodedHeic.width}×${wasmDecodedHeic.height}，${wasmDecodedHeic.ms}ms）${appleInfo ? '；导出可重建 HDR（16bit PQ PNG）' : hdrInfo?.is_hdr ? '；导出将丢失 HDR' : ''}`, 5)
+        else if (appleInfo)
+          message.info(`检测到 Apple HDR HEIC：导出将重建 HDR 并输出 16bit PQ PNG（headroom ${appleInfo.headroom.toFixed(2)}×）`, 5)
         else if (gainMapJpeg)
           message.info('检测到 HDR（gain map JPEG）：导出将保留 HDR，水印区域按 SDR 白处理', 5)
         else if (hdrPng && hdrInfo.kind !== 'png-hlg')
@@ -118,8 +125,14 @@ export function useImageHandlers(formRef: any, initialFormValue: ExifParamsForm)
       let downloadBlob: Blob | null = null
       let dataUrl = ''
 
+      // Apple HDR HEIC：libheif 解 base+gain map → WASM 重建 HDR + 水印 → PQ PNG
+      if (appleHdr && uploadFile) {
+        console.log('wasm apple hdr composite export')
+        downloadBlob = await appleHdrExport(previewDom, uploadFile, appleHdr)
+      }
+
       // gain map JPEG：WASM Ultra HDR 组装（原生分辨率水印 + 保留 HDR）
-      if ((uploadImgType === 'image/jpeg' || uploadImgType === 'image/jpg') && hdrGainMapJpeg && uploadFile) {
+      if (!downloadBlob && (uploadImgType === 'image/jpeg' || uploadImgType === 'image/jpg') && hdrGainMapJpeg && uploadFile) {
         console.log('wasm ultrahdr composite export')
         downloadBlob = await compositeUltraHdrExport(previewDom, uploadFile, exifEnable, exifBlob)
       }
@@ -157,8 +170,8 @@ export function useImageHandlers(formRef: any, initialFormValue: ExifParamsForm)
 
       const link = document.createElement('a')
       link.href = downloadBlob ? URL.createObjectURL(downloadBlob) : dataUrl
-      // 扩展名跟随实际输出格式（PNG 输入输出 PNG，其余输出 JPEG）
-      const fileExt = uploadImgType === 'image/png' ? 'png' : 'jpg'
+      // 扩展名跟随实际输出格式（blob 优先，其次 PNG 输入，其余 JPEG）
+      const fileExt = downloadBlob?.type?.includes('png') || uploadImgType === 'image/png' ? 'png' : 'jpg'
       link.download = `${Date.now()}.${fileExt}`
       document.body.appendChild(link)
       link.click()

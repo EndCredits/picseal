@@ -762,6 +762,600 @@ pub fn ultrahdr_assemble(original: Vec<u8>, base: Vec<u8>, gainmap: Vec<u8>) -> 
     ultrahdr_assemble_inner(&original, &base, &gainmap).map_err(|e| JsValue::from_str(&e))
 }
 
+// ---- HEIC / Apple HDR gain map ----
+// Container parsing to locate the gain map item (Apple aux `auxl`+`auxC` URN or
+// ISO 21496-1 `tmap`) plus the Apple MakerNote headroom. The actual gain map
+// pixels are decoded by libheif in JS; math follows the MIT reference
+// (johncf/apple-hdr-heic), headroom formula per Apple's docs as implemented there.
+
+/// Iterate ISO-BMFF boxes in `data[start..end]`; returns (type, body_start, body_end).
+fn bmff_boxes(data: &[u8], start: usize, end: usize) -> Vec<([u8; 4], usize, usize)> {
+    let mut out = Vec::new();
+    let end = end.min(data.len());
+    let mut pos = start;
+    while pos + 8 <= end {
+        let size32 = u32::from_be_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]) as u64;
+        let typ = [data[pos + 4], data[pos + 5], data[pos + 6], data[pos + 7]];
+        let (hdr, size) = if size32 == 1 {
+            if pos + 16 > end {
+                break;
+            }
+            let hi = u32::from_be_bytes([data[pos + 8], data[pos + 9], data[pos + 10], data[pos + 11]]) as u64;
+            let lo = u32::from_be_bytes([data[pos + 12], data[pos + 13], data[pos + 14], data[pos + 15]]) as u64;
+            (16usize, (hi << 32) | lo)
+        } else if size32 == 0 {
+            (8usize, (end - pos) as u64)
+        } else {
+            (8usize, size32)
+        };
+        if size < hdr as u64 {
+            break;
+        }
+        let body_end = (pos + size as usize).min(end);
+        out.push((typ, pos + hdr, body_end));
+        pos += size as usize;
+    }
+    out
+}
+
+fn be_u16(data: &[u8], off: usize) -> Option<u16> {
+    if off + 2 <= data.len() {
+        Some(u16::from_be_bytes([data[off], data[off + 1]]))
+    } else {
+        None
+    }
+}
+
+// (item_id, item_type); item_type is [0;4] for infe v0/v1
+fn heic_items(meta: &[u8]) -> Vec<(u16, [u8; 4])> {
+    let mut items = Vec::new();
+    for (typ, body, end) in bmff_boxes(meta, 0, meta.len()) {
+        if typ != *b"iinf" || body + 4 > end {
+            continue;
+        }
+        let version = meta[body];
+        let mut pos = body + 4;
+        let count = if version == 0 {
+            let c = be_u16(meta, pos).unwrap_or(0) as usize;
+            pos += 2;
+            c
+        } else {
+            let c = match u32be(meta, pos) {
+                Some(c) => c,
+                None => break,
+            };
+            pos += 4;
+            c
+        };
+        let _ = count;
+        for (t2, b2, e2) in bmff_boxes(meta, pos, end) {
+            if t2 != *b"infe" || b2 + 4 > e2 {
+                continue;
+            }
+            let ver = meta[b2];
+            let mut p = b2 + 4;
+            let id = be_u16(meta, p).unwrap_or(0);
+            p += 2;
+            p += 2; // protection index
+            let mut itype = [0u8; 4];
+            if ver >= 2 && p + 4 <= e2 {
+                itype.copy_from_slice(&meta[p..p + 4]);
+            }
+            items.push((id, itype));
+        }
+    }
+    items
+}
+
+type RefPairs = Vec<([u8; 4], Vec<(u16, Vec<u16>)>)>;
+
+// reference pairs per type: type -> [(from, [to; n])]
+fn heic_references(meta: &[u8]) -> RefPairs {
+    let mut out = Vec::new();
+    for (typ, body, end) in bmff_boxes(meta, 0, meta.len()) {
+        if typ != *b"iref" || body + 4 > end {
+            continue;
+        }
+        for (rtyp, rb, re) in bmff_boxes(meta, body + 4, end) {
+            let from = match be_u16(meta, rb) {
+                Some(v) => v,
+                None => continue,
+            };
+            let n = match be_u16(meta, rb + 2) {
+                Some(v) => v as usize,
+                None => continue,
+            };
+            let mut tos = Vec::new();
+            for i in 0..n {
+                if let Some(t) = be_u16(meta, rb + 4 + i * 2) {
+                    tos.push(t);
+                }
+            }
+            if re >= rb + 4 {
+                out.push((rtyp, vec![(from, tos)]));
+            }
+        }
+    }
+    out
+}
+
+fn heic_primary_item(meta: &[u8]) -> Option<u16> {
+    for (typ, body, _) in bmff_boxes(meta, 0, meta.len()) {
+        if typ == *b"pitm" && body + 4 <= meta.len() {
+            let version = meta[body];
+            if version == 0 {
+                return be_u16(meta, body + 4);
+            }
+            return u32be(meta, body + 4).map(|v| v as u16);
+        }
+    }
+    None
+}
+
+type PropBox = ([u8; 4], usize, usize);
+type ItemProps = (Vec<PropBox>, Vec<(u16, Vec<u16>)>);
+
+// ipco property boxes (type + absolute body range) in 1-based order, and
+// ipma associations item_id -> property indices
+fn heic_item_properties(meta: &[u8]) -> ItemProps {
+    let mut props: Vec<PropBox> = Vec::new();
+    let mut assoc: Vec<(u16, Vec<u16>)> = Vec::new();
+    for (typ, body, end) in bmff_boxes(meta, 0, meta.len()) {
+        if typ != *b"iprp" {
+            continue;
+        }
+        for (t2, b2, e2) in bmff_boxes(meta, body, end) {
+            if t2 == *b"ipco" {
+                props.extend(bmff_boxes(meta, b2, e2));
+            } else if t2 == *b"ipma" && b2 + 4 <= e2 {
+                // malformed ipma: keep whatever entries parsed so far
+                let _ = (|| -> Option<()> {
+                    let version = meta[b2];
+                    let flags = meta[b2 + 3];
+                    let count = u32be(meta, b2 + 4)?;
+                    let mut p = b2 + 8;
+                    for _ in 0..count {
+                        let item_id = if version < 1 {
+                            let v = be_u16(meta, p)?;
+                            p += 2;
+                            v
+                        } else {
+                            let v = u32be(meta, p)?;
+                            p += 4;
+                            v as u16
+                        };
+                        let n = if flags & 1 != 0 {
+                            let v = be_u16(meta, p)?;
+                            p += 2;
+                            v as usize
+                        } else {
+                            let v = *meta.get(p)?;
+                            p += 1;
+                            v as usize
+                        };
+                        let mut indices = Vec::with_capacity(n);
+                        for _ in 0..n {
+                            if flags & 1 != 0 {
+                                let v = be_u16(meta, p)?;
+                                p += 2;
+                                indices.push(v & 0x7fff);
+                            } else {
+                                let v = *meta.get(p)?;
+                                p += 1;
+                                indices.push((v & 0x7f) as u16);
+                            }
+                        }
+                        assoc.push((item_id, indices));
+                    }
+                    Some(())
+                })();
+            }
+        }
+    }
+    (props, assoc)
+}
+
+#[derive(Serialize)]
+struct AppleHeicInfo {
+    ok: bool,
+    kind: String,
+    gainmap_item_id: u32,
+    headroom: f64,
+}
+
+// Apple's documented headroom derivation (see johncf/apple-hdr-heic, MIT)
+fn apple_headroom(maker33: f64, maker48: f64) -> f64 {
+    let stops = if maker33 < 1.0 {
+        if maker48 <= 0.01 {
+            -20.0 * maker48 + 1.8
+        } else {
+            -0.101 * maker48 + 1.601
+        }
+    } else if maker48 <= 0.01 {
+        -70.0 * maker48 + 3.0
+    } else {
+        -0.303 * maker48 + 2.303
+    };
+    2f64.powf(stops.max(0.0))
+}
+
+// Apple maker note: "Apple iOS\0" + version/flags(3) + "MM"/"II" + IFD count(u16)
+// + 12-byte entries; value offsets are relative to the maker note start.
+fn parse_apple_makernote(mn: &[u8]) -> Option<(f64, f64)> {
+    if mn.len() < 20 {
+        return None;
+    }
+    let be = match &mn[12..14] {
+        b"MM" => true,
+        b"II" => false,
+        _ => return None,
+    };
+    let u16at = |o: usize| -> Option<u16> {
+        if o + 2 <= mn.len() {
+            Some(if be { u16::from_be_bytes([mn[o], mn[o + 1]]) } else { u16::from_le_bytes([mn[o], mn[o + 1]]) })
+        } else {
+            None
+        }
+    };
+    let u32at = |o: usize| -> Option<u32> {
+        if o + 4 <= mn.len() {
+            Some(if be {
+                u32::from_be_bytes([mn[o], mn[o + 1], mn[o + 2], mn[o + 3]])
+            } else {
+                u32::from_le_bytes([mn[o], mn[o + 1], mn[o + 2], mn[o + 3]])
+            })
+        } else {
+            None
+        }
+    };
+    let count = u16at(14)? as usize;
+    if count == 0 || count > 200 || 16 + count * 12 > mn.len() {
+        return None;
+    }
+    let (mut headroom, mut gain) = (None, None);
+    for k in 0..count {
+        let p = 16 + k * 12;
+        let tag = u16at(p)?;
+        let typ = u16at(p + 2)?;
+        let cnt = u32at(p + 4)?;
+        let val = u32at(p + 8)? as usize;
+        if (tag == 0x21 || tag == 0x30) && typ == 10 && cnt == 1 && val + 8 <= mn.len() {
+            let num = u32at(val)? as f64;
+            let den = u32at(val + 4)? as f64;
+            if den == 0.0 {
+                continue;
+            }
+            if tag == 0x21 {
+                headroom = Some(num / den);
+            } else {
+                gain = Some(num / den);
+            }
+        }
+    }
+    Some((headroom?, gain?))
+}
+
+fn apple_makernote_values(raw: &[u8]) -> Option<(f64, f64)> {
+    let magic: &[u8] = b"Apple iOS\0";
+    let mut at = 0usize;
+    while let Some(i) = raw[at..].windows(magic.len()).position(|w| w == magic).map(|p| p + at) {
+        if let Some(v) = parse_apple_makernote(&raw[i..]) {
+            return Some(v);
+        }
+        at = i + magic.len();
+    }
+    None
+}
+
+fn heic_apple_info_inner(raw: &[u8]) -> AppleHeicInfo {
+    let none = AppleHeicInfo { ok: false, kind: String::new(), gainmap_item_id: 0, headroom: 0.0 };
+    let (meta_start, meta_end) = match bmff_meta_range(raw) {
+        Some(r) => r,
+        None => return none,
+    };
+    let meta = &raw[meta_start..meta_end];
+    let items = heic_items(meta);
+    let refs = heic_references(meta);
+    let primary = heic_primary_item(meta);
+    let (props, assoc) = heic_item_properties(meta);
+
+    // auxiliary-image type URN declared by an item's `auxC` property
+    let auxc_of = |item_id: u16| -> Option<&[u8]> {
+        let indices = assoc.iter().find(|(id, _)| *id == item_id)?.1.clone();
+        for idx in indices {
+            let (ptyp, pb, pe) = *props.get((idx as usize).checked_sub(1)?)?;
+            if ptyp != *b"auxC" || pb + 4 > pe {
+                continue;
+            }
+            let urn_start = pb + 4;
+            let urn_end = meta[urn_start..pe].iter().position(|&b| b == 0).map(|l| urn_start + l).unwrap_or(pe);
+            return Some(&meta[urn_start..urn_end]);
+        }
+        None
+    };
+
+    let mut result = none;
+    // Apple aux gain map: `auxl` reference to the primary, auxC URN mentions hdrgainmap
+    if let Some(primary) = primary {
+        'outer: for (rtyp, pairs) in &refs {
+            if rtyp != b"auxl" {
+                continue;
+            }
+            for (from, tos) in pairs {
+                if !tos.contains(&primary) {
+                    continue;
+                }
+                let itype = items.iter().find(|(id, _)| id == from).map(|(_, t)| *t).unwrap_or([0; 4]);
+                let is_image = itype == *b"hvc1" || itype == *b"grid" || itype == *b"hevc" || itype == *b"av01";
+                if !is_image {
+                    continue;
+                }
+                if let Some(urn) = auxc_of(*from) {
+                    if contains(urn, b"hdrgainmap") {
+                        result.kind = "apple-aux".to_string();
+                        result.gainmap_item_id = *from as u32;
+                        break 'outer;
+                    }
+                }
+            }
+        }
+    }
+    // ISO 21496-1: `tmap` item referencing base + gain map
+    if result.gainmap_item_id == 0 {
+        if let Some((tmap_id, _)) = items.iter().find(|(_, t)| t == b"tmap") {
+            for (rtyp, pairs) in &refs {
+                if rtyp != b"dimg" {
+                    continue;
+                }
+                for (from, tos) in pairs {
+                    if from == tmap_id && tos.len() >= 2 {
+                        result.kind = "iso-tmap".to_string();
+                        result.gainmap_item_id = tos[1] as u32;
+                    }
+                }
+            }
+        }
+    }
+    // headroom from Apple MakerNote
+    if let Some((hr, gain)) = apple_makernote_values(raw) {
+        result.headroom = apple_headroom(hr, gain);
+    }
+    result.ok = result.gainmap_item_id != 0 && result.headroom > 1.0;
+    result
+}
+
+#[wasm_bindgen]
+pub fn heic_apple_info(raw: Vec<u8>) -> JsValue {
+    let info = heic_apple_info_inner(&raw);
+    <wasm_bindgen::JsValue as JsValueSerdeExt>::from_serde(&info).unwrap()
+}
+
+// Display P3 -> BT.2020 linear (D65); row sums = 1 so white is preserved
+const P3_TO_BT2020: [[f64; 3]; 3] = [
+    [0.7538, 0.2346, 0.0116],
+    [0.0458, 0.9409, 0.0133],
+    [0.0012, 0.0556, 0.9432],
+];
+
+// sRGB EOTF with linear interpolation (1024 steps): the base is 8-bit but the
+// gain map is bilinearly resampled, so fractional inputs occur
+struct SrgbEotf {
+    lut: [f64; 1025],
+    lut8: [f64; 256],
+}
+
+impl SrgbEotf {
+    fn new() -> Self {
+        let mut lut = [0.0f64; 1025];
+        for (i, v) in lut.iter_mut().enumerate() {
+            *v = srgb_to_linear(i as f64 / 1024.0);
+        }
+        let mut lut8 = [0.0f64; 256];
+        for (i, v) in lut8.iter_mut().enumerate() {
+            *v = srgb_to_linear(i as f64 / 255.0);
+        }
+        SrgbEotf { lut, lut8 }
+    }
+
+    fn eval8(&self, v: u8) -> f64 {
+        self.lut8[v as usize]
+    }
+
+    fn eval(&self, v: f64) -> f64 {
+        let x = (v.clamp(0.0, 1.0)) * 1024.0;
+        let i = x.floor() as usize;
+        if i >= 1024 {
+            return 1.0;
+        }
+        let f = x - i as f64;
+        self.lut[i] + (self.lut[i + 1] - self.lut[i]) * f
+    }
+}
+
+// Relative linear luminance (1.0 = SDR reference white = 203 nits) -> PQ code
+fn pq_code_from_linear(lin: f64) -> u16 {
+    let code = pq_oetf(lin * WATERMARK_SDR_WHITE_NITS) * 65535.0 + 0.5;
+    code.clamp(0.0, 65535.0) as u16
+}
+
+// Compose an Apple HDR HEIC (base RGBA8 Display P3 + grayscale gain map) into a
+// 16-bit PQ PNG (BT.2020, cICP 9/16/0/1) with the watermark banner applied.
+// Math per the MIT reference (johncf/apple-hdr-heic):
+//   hdr_linear = srgb_eotf(base) * (1 + (headroom - 1) * srgb_eotf(gain))
+#[allow(clippy::too_many_arguments)] // wasm 入口按扁平分片传参，inner 与之对应
+fn apple_hdr_compose_inner(
+    base: &[u8],
+    base_w: usize,
+    base_h: usize,
+    gainmap: &[u8],
+    gm_w: usize,
+    gm_h: usize,
+    headroom: f64,
+    mask: &[u8],
+    mask_w: usize,
+    mask_h: usize,
+    off_x: usize,
+    off_y: usize,
+) -> Result<Vec<u8>, String> {
+    if base_w == 0 || base_h == 0 || base.len() < base_w * base_h * 4 {
+        return Err("bad base image".to_string());
+    }
+    if gm_w == 0 || gm_h == 0 || gainmap.len() < gm_w * gm_h * 4 {
+        return Err("bad gain map".to_string());
+    }
+    if mask.len() < mask_w * mask_h * 4 {
+        return Err("mask buffer too small".to_string());
+    }
+    if off_x + mask_w > base_w {
+        return Err("mask wider than image".to_string());
+    }
+    if !headroom.is_finite() || headroom < 1.0 {
+        return Err("invalid headroom".to_string());
+    }
+    let out_h = base_h.max(off_y + mask_h);
+    let srgb = SrgbEotf::new();
+    let pq = PqEncoder::new();
+    let scale_range = headroom - 1.0;
+    let white = watermark_codes([255, 255, 255], PngTransfer::Pq, PngPrimaries::Bt2020, true);
+
+    let mut encoded: Vec<u8> = Vec::new();
+    {
+        use std::io::Write as _;
+        let mut encoder = png::Encoder::new(&mut encoded, base_w as u32, out_h as u32);
+        encoder.set_color(png::ColorType::Rgb);
+        encoder.set_depth(png::BitDepth::Sixteen);
+        encoder.set_compression(png::Compression::Fast);
+        let mut writer = encoder.write_header().map_err(|e| format!("encode: {e}"))?;
+        let mut stream = writer.stream_writer().map_err(|e| format!("encode: {e}"))?;
+        let mut row = vec![0u8; base_w * 6];
+        for y in 0..out_h {
+            let mask_y = if y >= off_y && y < off_y + mask_h { Some(y - off_y) } else { None };
+            if y >= base_h {
+                // extension below the photo: reference white, then the watermark
+                // mask is composited on top (it may span this area)
+                let mut i = 0usize;
+                for x in 0..base_w {
+                    let mut codes = [white[0] as u16, white[1] as u16, white[2] as u16];
+                    if let Some(my) = mask_y {
+                        if x >= off_x && x < off_x + mask_w {
+                            let mi = (my * mask_w + (x - off_x)) * 4;
+                            let a = mask[mi + 3] as u32;
+                            if a > 0 {
+                                let inv = 255 - a;
+                                let wmc = watermark_codes([mask[mi], mask[mi + 1], mask[mi + 2]], PngTransfer::Pq, PngPrimaries::Bt2020, true);
+                                for c in 0..3 {
+                                    let src = codes[c] as u32;
+                                    codes[c] = ((src * inv + wmc[c] * a + 127) / 255) as u16;
+                                }
+                            }
+                        }
+                    }
+                    for code in &codes {
+                        let b = code.to_be_bytes();
+                        row[i] = b[0];
+                        row[i + 1] = b[1];
+                        i += 2;
+                    }
+                }
+            } else {
+                let base_row = &base[y * base_w * 4..(y + 1) * base_w * 4];
+                let gy = ((y as f64 + 0.5) * gm_h as f64 / base_h as f64 - 0.5).max(0.0);
+                let gy0 = gy.floor() as usize;
+                let gy1 = (gy0 + 1).min(gm_h - 1);
+                let fy = (gy - gy0 as f64).clamp(0.0, 1.0);
+                let mut i = 0usize;
+                for x in 0..base_w {
+                    let px = &base_row[x * 4..x * 4 + 4];
+                    let p3 = [srgb.eval8(px[0]), srgb.eval8(px[1]), srgb.eval8(px[2])];
+                    let gx = ((x as f64 + 0.5) * gm_w as f64 / base_w as f64 - 0.5).max(0.0);
+                    let gx0 = gx.floor() as usize;
+                    let gx1 = (gx0 + 1).min(gm_w - 1);
+                    let fx = (gx - gx0 as f64).clamp(0.0, 1.0);
+                    let g00 = gainmap[(gy0 * gm_w + gx0) * 4] as f64 / 255.0;
+                    let g01 = gainmap[(gy0 * gm_w + gx1) * 4] as f64 / 255.0;
+                    let g10 = gainmap[(gy1 * gm_w + gx0) * 4] as f64 / 255.0;
+                    let g11 = gainmap[(gy1 * gm_w + gx1) * 4] as f64 / 255.0;
+                    let g = (g00 + (g01 - g00) * fx) + ((g10 + (g11 - g10) * fx) - (g00 + (g01 - g00) * fx)) * fy;
+                    let scale = 1.0 + scale_range * srgb.eval(g);
+                    let mut codes = [0u16; 3];
+                    for c in 0..3 {
+                        let lin = (P3_TO_BT2020[c][0] * p3[0] + P3_TO_BT2020[c][1] * p3[1] + P3_TO_BT2020[c][2] * p3[2]) * scale;
+                        codes[c] = pq.code(lin);
+                    }
+                    if let Some(my) = mask_y {
+                        if x >= off_x && x < off_x + mask_w {
+                            let mi = (my * mask_w + (x - off_x)) * 4;
+                            let a = mask[mi + 3] as u32;
+                            if a > 0 {
+                                let inv = 255 - a;
+                                let wmc = watermark_codes([mask[mi], mask[mi + 1], mask[mi + 2]], PngTransfer::Pq, PngPrimaries::Bt2020, true);
+                                for c in 0..3 {
+                                    let src = codes[c] as u32;
+                                    codes[c] = ((src * inv + wmc[c] * a + 127) / 255) as u16;
+                                }
+                            }
+                        }
+                    }
+                    for code in &codes {
+                        let b = code.to_be_bytes();
+                        row[i] = b[0];
+                        row[i + 1] = b[1];
+                        i += 2;
+                    }
+                }
+            }
+            stream.write_all(&row).map_err(|e| format!("encode: {e}"))?;
+        }
+        stream.finish().map_err(|e| format!("encode: {e}"))?;
+    }
+
+    let chunks = parse_png_chunks(&encoded)?;
+    let ihdr = chunks.iter().find(|c| c.typ == *b"IHDR").ok_or("encoder produced no IHDR")?;
+    let mut out = Vec::with_capacity(encoded.len() + 64);
+    out.extend_from_slice(&PNG_SIG);
+    write_chunk(&mut out, b"IHDR", ihdr.data);
+    // BT.2020 primaries, PQ transfer, matrix 0 (RGB), full range
+    write_chunk(&mut out, b"cICP", &[9, 16, 0, 1]);
+    for c in chunks.iter().filter(|c| c.typ == *b"IDAT") {
+        write_chunk(&mut out, b"IDAT", c.data);
+    }
+    write_chunk(&mut out, b"IEND", &[]);
+    Ok(out)
+}
+
+#[allow(clippy::too_many_arguments)] // wasm 入口按扁平分片传参
+#[wasm_bindgen]
+pub fn apple_hdr_compose_png(
+    base: Vec<u8>,
+    base_w: u32,
+    base_h: u32,
+    gainmap: Vec<u8>,
+    gm_w: u32,
+    gm_h: u32,
+    headroom: f64,
+    mask: Vec<u8>,
+    mask_w: u32,
+    mask_h: u32,
+    off_x: u32,
+    off_y: u32,
+) -> Result<Vec<u8>, JsValue> {
+    apple_hdr_compose_inner(
+        &base,
+        base_w as usize,
+        base_h as usize,
+        &gainmap,
+        gm_w as usize,
+        gm_h as usize,
+        headroom,
+        &mask,
+        mask_w as usize,
+        mask_h as usize,
+        off_x as usize,
+        off_y as usize,
+    )
+    .map_err(|e| JsValue::from_str(&e))
+}
+
 // ---- PNG high-fidelity compositing ----
 // Decode at native bit depth, blend an RGBA watermark mask in the source's
 // gamma domain (identical math to CSS/canvas alpha compositing), re-encode at
@@ -865,16 +1459,70 @@ fn srgb_to_linear(v: f64) -> f64 {
     }
 }
 
+const PQ_M1: f64 = 2610.0 / 16384.0;
+const PQ_M2: f64 = 2523.0 / 4096.0 * 128.0;
+const PQ_C1: f64 = 3424.0 / 4096.0;
+const PQ_C2: f64 = 2413.0 / 4096.0 * 32.0;
+const PQ_C3: f64 = 2392.0 / 4096.0 * 32.0;
+
 // ST.2084 (PQ) OETF: absolute luminance in nits → normalized code [0, 1]
 fn pq_oetf(nits: f64) -> f64 {
-    const M1: f64 = 2610.0 / 16384.0;
-    const M2: f64 = 2523.0 / 4096.0 * 128.0;
-    const C1: f64 = 3424.0 / 4096.0;
-    const C2: f64 = 2413.0 / 4096.0 * 32.0;
-    const C3: f64 = 2392.0 / 4096.0 * 32.0;
     let y = (nits / 10000.0).max(0.0);
-    let ym = y.powf(M1);
-    ((C1 + C2 * ym) / (1.0 + C3 * ym)).powf(M2)
+    let ym = y.powf(PQ_M1);
+    ((PQ_C1 + PQ_C2 * ym) / (1.0 + PQ_C3 * ym)).powf(PQ_M2)
+}
+
+// Fast PQ encoder for the Apple HDR path: per-pixel powf is too slow, so
+// v -> v^m1 is tabulated over u = v^(1/8) (three hardware sqrts make the
+// interpolated function near-linear) and the final X^m2 over Ym.
+struct PqEncoder {
+    umax: f64,
+    k: f64,
+    ym_max: f64,
+    vm1: Vec<f64>,
+    g: Vec<f64>,
+}
+
+impl PqEncoder {
+    fn new() -> Self {
+        const VMAX: f64 = 32.0;
+        const N: usize = 2048;
+        let umax = VMAX.powf(0.125);
+        let mut vm1 = Vec::with_capacity(N + 1);
+        for i in 0..=N {
+            let u = i as f64 / N as f64 * umax;
+            let v = u * u * u * u * u * u * u * u;
+            vm1.push(v.powf(PQ_M1));
+        }
+        let ym_max = (0.0203 * VMAX).powf(PQ_M1);
+        let mut g = Vec::with_capacity(N + 1);
+        for i in 0..=N {
+            let ym = i as f64 / N as f64 * ym_max;
+            g.push(((PQ_C1 + PQ_C2 * ym) / (1.0 + PQ_C3 * ym)).powf(PQ_M2) * 65535.0);
+        }
+        PqEncoder { umax, k: 0.0203f64.powf(PQ_M1), ym_max, vm1, g }
+    }
+
+    fn code(&self, v: f64) -> u16 {
+        let v = v.max(0.0);
+        if v >= 32.0 {
+            return pq_code_from_linear(v);
+        }
+        let u = (v.sqrt()).sqrt().sqrt();
+        let n = (self.vm1.len() - 1) as f64;
+        // v^m1
+        let p = (u / self.umax * n).min(n);
+        let i = p.floor() as usize;
+        let f = p - i as f64;
+        let vm = self.vm1[i] + (self.vm1[(i + 1).min(self.vm1.len() - 1)] - self.vm1[i]) * f;
+        // X^m2 (code)
+        let ym = self.k * vm;
+        let p2 = (ym / self.ym_max * n).clamp(0.0, n);
+        let j = p2.floor() as usize;
+        let f2 = p2 - j as f64;
+        let code = self.g[j] + (self.g[(j + 1).min(self.g.len() - 1)] - self.g[j]) * f2;
+        (code + 0.5).clamp(0.0, 65535.0) as u16
+    }
 }
 
 // BT.2100 HLG OETF (scene linear → signal), piecewise at E = 1/12 / signal 0.5
@@ -1040,7 +1688,7 @@ fn png_composite(
                 for c in 0..channels {
                     let code = if c == 3 { if sixteen { 65535 } else { 255 } } else { white_codes[c.min(2)] };
                     if sixteen {
-                        let b = (code as u16).to_ne_bytes();
+                        let b = (code as u16).to_be_bytes();
                         row[i] = b[0];
                         row[i + 1] = b[1];
                         i += 2;
@@ -1084,9 +1732,9 @@ fn png_composite(
             for c in 0..channels {
                 let wm_code = if c == 3 { straight_code(mask[mi + 2], sixteen) } else { codes[c.min(2)] };
                 if sixteen {
-                    let src = u16::from_ne_bytes([canvas[di + c * 2], canvas[di + c * 2 + 1]]) as u32;
+                    let src = u16::from_be_bytes([canvas[di + c * 2], canvas[di + c * 2 + 1]]) as u32;
                     let out = (src * inv + wm_code * a + 127) / 255;
-                    let outb = (out as u16).to_ne_bytes();
+                    let outb = (out as u16).to_be_bytes();
                     canvas[di + c * 2] = outb[0];
                     canvas[di + c * 2 + 1] = outb[1];
                 } else {
@@ -1292,7 +1940,7 @@ mod tests {
         for _ in 0..(w * h) {
             for c in 0..channels as u16 {
                 if sixteen {
-                    data.extend_from_slice(&(fill + c).to_ne_bytes());
+                    data.extend_from_slice(&(fill + c).to_be_bytes());
                 } else {
                     data.push((fill + c) as u8);
                 }
@@ -1311,7 +1959,7 @@ mod tests {
 
     #[test]
     fn png16_endianness_roundtrip() {
-        // 已知值 0x1234 编码后，经 crate 解码应还原（确认 native-endian 约定）
+        // 已知值 0x1234 编码后，经 crate 解码应还原（crate 对 16bit 为文件字节序原样透传）
         let src = encode_test_png(2, 2, true, false, 0x1234);
         let decoder = png::Decoder::new(std::io::Cursor::new(&src));
         let mut reader = decoder.read_info().unwrap();
@@ -1319,8 +1967,8 @@ mod tests {
         let info = reader.next_frame(&mut buf).unwrap();
         buf.truncate(info.buffer_size());
         assert_eq!(info.bit_depth, png::BitDepth::Sixteen);
-        let first = u16::from_ne_bytes([buf[0], buf[1]]);
-        assert_eq!(first, 0x1234, "png crate 16bit samples must be native-endian");
+        let first = u16::from_be_bytes([buf[0], buf[1]]);
+        assert_eq!(first, 0x1234, "png crate 16bit samples stay in file byte order (big-endian)");
     }
 
     #[test]
@@ -1524,7 +2172,7 @@ mod tests {
                     // 不透明白 → 全 65535
                     checked_inside += 1;
                     for c in 0..3 {
-                        let v = u16::from_ne_bytes([ob[di + c * 2], ob[di + c * 2 + 1]]);
+                        let v = u16::from_be_bytes([ob[di + c * 2], ob[di + c * 2 + 1]]);
                         if v != 65535 {
                             bad_inside += 1;
                             break;
@@ -1534,10 +2182,10 @@ mod tests {
                     // alpha=128 红：R = (src+65535*... )/255 公式验证一行
                     checked_inside += 1;
                     for c in 0..3 {
-                        let s = u16::from_ne_bytes([sb[di + c * 2], sb[di + c * 2 + 1]]) as u32;
+                        let s = u16::from_be_bytes([sb[di + c * 2], sb[di + c * 2 + 1]]) as u32;
                         let wm = if c == 0 { 255u32 * 257 } else { 0 };
                         let expect = ((s * 127 + wm * 128 + 127) / 255) as u16;
-                        let got = u16::from_ne_bytes([ob[di + c * 2], ob[di + c * 2 + 1]]);
+                        let got = u16::from_be_bytes([ob[di + c * 2], ob[di + c * 2 + 1]]);
                         if got != expect {
                             bad_inside += 1;
                             break;
@@ -1737,7 +2385,7 @@ mod tests {
         assert_eq!(info.bit_depth, png::BitDepth::Sixteen);
         let ch = |x: usize, y: usize, c: usize| {
             let i = (y * 2 + x) * 6 + c * 2;
-            u32::from(u16::from_ne_bytes([buf[i], buf[i + 1]]))
+            u32::from(u16::from_be_bytes([buf[i], buf[i + 1]]))
         };
         assert_eq!(ch(0, 0, 0), 38055, "opaque white → 203nit PQ code");
         assert_eq!((ch(1, 0, 0), ch(1, 0, 1), ch(1, 0, 2)), (17568, 10808, 7290), "alpha blend uses sRGB→BT.2020 mapped codes");
@@ -1769,7 +2417,7 @@ mod tests {
         assert_eq!(info.bit_depth, png::BitDepth::Sixteen);
         let ch = |x: usize, y: usize, c: usize| {
             let i = (y * 2 + x) * 6 + c * 2;
-            u32::from(u16::from_ne_bytes([buf[i], buf[i + 1]]))
+            u32::from(u16::from_be_bytes([buf[i], buf[i + 1]]))
         };
         assert_eq!(ch(0, 0, 0), 49151, "opaque white → 75% HLG signal");
         assert_eq!((ch(1, 0, 0), ch(1, 0, 1), ch(1, 0, 2)), (21626, 7760, 3806), "alpha blend uses sRGB→BT.2020 mapped codes");
@@ -1786,7 +2434,7 @@ mod tests {
         assert_eq!((info.width, info.height), (2, 4));
         let ch = |x: usize, y: usize, c: usize| {
             let i = (y * 2 + x) * 6 + c * 2;
-            u32::from(u16::from_ne_bytes([buf[i], buf[i + 1]]))
+            u32::from(u16::from_be_bytes([buf[i], buf[i + 1]]))
         };
         for y in 2..4 {
             for x in 0..2 {
@@ -1815,7 +2463,7 @@ mod tests {
         assert_eq!((info.width, info.height), (2, 4));
         let ch = |x: usize, y: usize, c: usize| {
             let i = (y * 2 + x) * 6 + c * 2;
-            u32::from(u16::from_ne_bytes([buf[i], buf[i + 1]]))
+            u32::from(u16::from_be_bytes([buf[i], buf[i + 1]]))
         };
         for y in 2..4 {
             for x in 0..2 {
@@ -1878,6 +2526,143 @@ mod tests {
             .map(|s| s.payload.to_vec())
             .unwrap();
         assert_eq!(out_icc, orig_icc, "original HDR intent profile must survive");
+    }
+
+    // ---- Apple HDR (HEIC) tests ----
+
+    #[test]
+    fn apple_headroom_reference_values() {
+        // exiftool: IMG_9519 HDRHeadroom=1.540691019 HDRGain=0.0184198767
+        let h1 = apple_headroom(1.540691019, 0.0184198767);
+        assert!((h1 - 4.915774637972608).abs() < 1e-9, "{h1}");
+        // exiftool: IMG_9538 HDRHeadroom=1.489122509 HDRGain=0
+        let h2 = apple_headroom(1.489122509, 0.0);
+        assert!((h2 - 8.0).abs() < 1e-12, "{h2}");
+    }
+
+    #[test]
+    fn apple_makernote_synthetic() {
+        let mut mn = Vec::new();
+        mn.extend_from_slice(b"Apple iOS\0");
+        mn.extend_from_slice(&[0, 1]);
+        mn.extend_from_slice(b"MM");
+        mn.extend_from_slice(&2u16.to_be_bytes()); // IFD count at 14
+        // entry 0: tag 0x21 SRATIONAL count 1 value offset 40
+        mn.extend_from_slice(&0x0021u16.to_be_bytes());
+        mn.extend_from_slice(&10u16.to_be_bytes());
+        mn.extend_from_slice(&1u32.to_be_bytes());
+        mn.extend_from_slice(&40u32.to_be_bytes());
+        // entry 1: tag 0x30 SRATIONAL count 1 value offset 48
+        mn.extend_from_slice(&0x0030u16.to_be_bytes());
+        mn.extend_from_slice(&10u16.to_be_bytes());
+        mn.extend_from_slice(&1u32.to_be_bytes());
+        mn.extend_from_slice(&48u32.to_be_bytes());
+        mn.extend_from_slice(&29609u32.to_be_bytes());
+        mn.extend_from_slice(&19218u32.to_be_bytes());
+        mn.extend_from_slice(&4658u32.to_be_bytes());
+        mn.extend_from_slice(&252879u32.to_be_bytes());
+        let (hr, g) = parse_apple_makernote(&mn).unwrap();
+        assert!((hr - 1.540691019).abs() < 1e-9);
+        assert!((g - 0.0184198767).abs() < 1e-9);
+        assert!((apple_headroom(hr, g) - 4.915774637972608).abs() < 1e-9);
+    }
+
+    #[test]
+    fn heic_apple_info_real_samples() {
+        let cases = [
+            ("../test_pictures/IMG_9519.HEIC", 63u32, 4.915774637972608),
+            ("../test_pictures/IMG_9538.HEIC", 65u32, 8.0),
+        ];
+        let mut ran = 0;
+        for (p, item_id, headroom) in cases {
+            if let Ok(b) = std::fs::read(p) {
+                ran += 1;
+                let info = heic_apple_info_inner(&b);
+                assert!(info.ok, "{p} must parse");
+                assert_eq!(info.kind, "apple-aux", "{p} kind");
+                assert_eq!(info.gainmap_item_id, item_id, "{p} gain map item id");
+                assert!((info.headroom - headroom).abs() < 1e-6, "{p} headroom {} vs {headroom}", info.headroom);
+            }
+        }
+        if ran == 0 {
+            eprintln!("SKIP: no local samples");
+        }
+    }
+
+    fn solid_rgba(w: usize, h: usize, rgb: [u8; 3], a: u8) -> Vec<u8> {
+        let mut v = Vec::with_capacity(w * h * 4);
+        for _ in 0..w * h {
+            v.extend_from_slice(&[rgb[0], rgb[1], rgb[2], a]);
+        }
+        v
+    }
+
+    fn px16(buf: &[u8], w: usize, x: usize, y: usize, c: usize) -> u16 {
+        let i = (y * w + x) * 6 + c * 2;
+        u16::from_be_bytes([buf[i], buf[i + 1]])
+    }
+
+    #[test]
+    fn apple_hdr_compose_reference_codes() {
+        let gm0 = solid_rgba(2, 2, [0, 0, 0], 255);
+        let gm255 = solid_rgba(2, 2, [255, 255, 255], 255);
+        let no_mask = vec![0u8; 4];
+
+        // SDR passthrough: headroom 1 → PQ(203 nits) per channel
+        let white = solid_rgba(2, 2, [255, 255, 255], 255);
+        let out = apple_hdr_compose_inner(&white, 2, 2, &gm0, 2, 2, 1.0, &no_mask, 1, 1, 0, 0).unwrap();
+        let (info, buf) = decode_png_buf(&out);
+        assert_eq!(info.bit_depth, png::BitDepth::Sixteen);
+        assert_eq!(info.color_type, png::ColorType::Rgb);
+        assert_eq!([px16(&buf, 2, 0, 0, 0), px16(&buf, 2, 0, 0, 1), px16(&buf, 2, 0, 0, 2)], [38055; 3]);
+
+        let red = solid_rgba(2, 2, [255, 0, 0], 255);
+        let out = apple_hdr_compose_inner(&red, 2, 2, &gm0, 2, 2, 1.0, &no_mask, 1, 1, 0, 0).unwrap();
+        let (_, buf) = decode_png_buf(&out);
+        assert_eq!([px16(&buf, 2, 0, 0, 0), px16(&buf, 2, 0, 0, 1), px16(&buf, 2, 0, 0, 2)], [36133, 19266, 5867]);
+
+        let gray = solid_rgba(2, 2, [100, 100, 100], 255);
+        let out = apple_hdr_compose_inner(&gray, 2, 2, &gm0, 2, 2, 1.0, &no_mask, 1, 1, 0, 0).unwrap();
+        let (_, buf) = decode_png_buf(&out);
+        assert_eq!(px16(&buf, 2, 0, 0, 0), 24876);
+
+        // Full gain: 203 * headroom nits
+        let out = apple_hdr_compose_inner(&white, 2, 2, &gm255, 2, 2, 4.0, &no_mask, 1, 1, 0, 0).unwrap();
+        let (_, buf) = decode_png_buf(&out);
+        assert_eq!(px16(&buf, 2, 0, 0, 0), 47785);
+        let out = apple_hdr_compose_inner(&white, 2, 2, &gm255, 2, 2, 4.915774637972608, &no_mask, 1, 1, 0, 0).unwrap();
+        let (_, buf) = decode_png_buf(&out);
+        assert_eq!(px16(&buf, 2, 0, 0, 0), 49256);
+    }
+
+    #[test]
+    fn apple_hdr_compose_watermark_extension_cicp() {
+        let base = solid_rgba(2, 2, [100, 100, 100], 255);
+        let gm0 = solid_rgba(2, 2, [0, 0, 0], 255);
+
+        // overlay: opaque white banner on the photo's last row
+        let mask = solid_rgba(2, 1, [255, 255, 255], 255);
+        let out = apple_hdr_compose_inner(&base, 2, 2, &gm0, 2, 2, 2.0, &mask, 2, 1, 0, 1).unwrap();
+        let (info, buf) = decode_png_buf(&out);
+        assert_eq!((info.width, info.height), (2, 2));
+        assert_eq!(px16(&buf, 2, 0, 0, 0), 24876, "photo row unchanged");
+        assert_eq!(px16(&buf, 2, 0, 1, 0), 38055, "opaque watermark → 203-nit PQ code");
+        assert_eq!(px16(&buf, 2, 1, 1, 0), 38055);
+
+        // extension: banner below the photo extends the canvas with reference white
+        let out = apple_hdr_compose_inner(&base, 2, 2, &gm0, 2, 2, 2.0, &mask, 2, 1, 0, 2).unwrap();
+        let (info, buf) = decode_png_buf(&out);
+        assert_eq!((info.width, info.height), (2, 3));
+        assert_eq!(px16(&buf, 2, 0, 1, 0), 24876, "photo row unchanged");
+        assert_eq!(px16(&buf, 2, 0, 2, 0), 38055, "extension row = reference white");
+        let chunks = parse_png_chunks(&out).unwrap();
+        assert!(chunks.iter().any(|c| c.typ == *b"cICP" && c.data == [9, 16, 0, 1]));
+
+        // semi-transparent watermark blends in code domain
+        let mask_half = solid_rgba(2, 1, [255, 255, 255], 128);
+        let out = apple_hdr_compose_inner(&base, 2, 2, &gm0, 2, 2, 2.0, &mask_half, 2, 1, 0, 1).unwrap();
+        let (_, buf) = decode_png_buf(&out);
+        assert_eq!(px16(&buf, 2, 0, 1, 0), 31491, "alpha=128 blend");
     }
 
     // ---- Ultra HDR assembly tests ----

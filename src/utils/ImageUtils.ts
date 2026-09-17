@@ -282,12 +282,23 @@ export async function buildBannerMask(previewDom: HTMLElement): Promise<BannerMa
   const offY = Math.round((bannerRect.top - imgRect.top) * scale)
   if (offX < 0 || offY < 0 || offX + width > img.naturalWidth)
     return null
-  const url = await rasterizeDomToDataUrl(banner, {
+  // 整幅预览按原生分辨率光栅化后裁剪 banner 区域：banner 元素单独光栅化在部分环境
+  // （含 headless Chrome）会得到全透明结果，改走与 SDR 导出同源的全幅渲染更稳
+  const fullUrl = await rasterizeDomToDataUrl(previewDom, {
     format: 'png',
-    width,
-    height,
+    width: Math.max(1, Math.round(previewDom.clientWidth * scale)),
+    height: Math.max(1, Math.round(previewDom.clientHeight * scale)),
     style: { transform: `scale(${scale})`, transformOrigin: 'top left' },
   })
+  const fullImg = await loadImage(fullUrl)
+  const canvas = document.createElement('canvas')
+  canvas.width = width
+  canvas.height = height
+  const ctx = canvas.getContext('2d')
+  if (!ctx)
+    return null
+  ctx.drawImage(fullImg, offX, offY, width, height, 0, 0, width, height)
+  const url = canvas.toDataURL('image/png')
   return { url, width, height, offX, offY, naturalWidth: img.naturalWidth, naturalHeight: img.naturalHeight }
 }
 
