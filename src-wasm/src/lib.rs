@@ -877,33 +877,52 @@ pub fn ultrahdr_assemble(original: Vec<u8>, base: Vec<u8>, gainmap: Vec<u8>) -> 
 }
 
 // ---- Ultra HDR creation from scratch (Apple HDR HEIC -> gain map JPEG) ----
-// Writes the ISO 21496-1 APP2 payload (libultrahdr `encodeGainmapMetadata`
-// layout, common denominator form, single channel, gamma 1) plus the hdrgm
-// XMP, then assembles base + gain map with a freshly computed MPF directory.
+// ISO 21496-1 APP2 layout as written by Apple (iOS 18+) and Google (libultrahdr):
+// the primary image carries the version-only structural marker, the gain map
+// image carries the parameters. Fractions are serialized as explicit
+// numerator/denominator pairs with power-of-two denominators (2^28); flags 0x40
+// marks "application space is the base colour space" (mandatory alongside the
+// hdrgm XMP), single channel, forward direction. The draft common-denominator
+// form (flags 0x08, decimal denominators, libultrahdr `encodeGainmapMetadata`)
+// is rejected by ImageIO / Apple Photos and by Chrome: they then drop the whole
+// gain map and the photo renders as SDR.
 
-const ISO21496_DENOM: u32 = 1_000_000;
+const ISO21496_DENOM: u32 = 1 << 28;
+
+// structural marker: this file is a gain map JPEG, params live in the gain map
+fn build_iso21496_1_version_payload() -> Vec<u8> {
+    let mut out = Vec::with_capacity(ISO21496_URN.len() + 4);
+    out.extend_from_slice(ISO21496_URN);
+    out.extend_from_slice(&[0, 0, 0, 0]); // min_version / writer_version
+    out
+}
+
+fn push_iso_fraction(out: &mut Vec<u8>, num: u32, den: u32) {
+    out.extend_from_slice(&num.to_be_bytes());
+    out.extend_from_slice(&den.to_be_bytes());
+}
 
 // boost factor is `2^(log2(headroom) * v)` for the normalized sample v, so the
 // Apple gain map value maps to v = log2(1 + (headroom-1) * srgb_eotf(g)) / log2(headroom)
-fn build_iso21496_1_payload(headroom: f64) -> Result<Vec<u8>, String> {
+fn build_iso21496_1_params_payload(headroom: f64) -> Result<Vec<u8>, String> {
     if !headroom.is_finite() || headroom <= 1.0 {
         return Err("invalid headroom".to_string());
     }
     let gain_max = headroom.log2();
     let den = ISO21496_DENOM;
-    let mut out = Vec::with_capacity(ISO21496_URN.len() + 4 + 1 + 4 * 8);
+    let head = (gain_max * den as f64).round() as u32;
+    let mut out = Vec::with_capacity(ISO21496_URN.len() + 4 + 1 + 8 * 7);
     out.extend_from_slice(ISO21496_URN);
     out.extend_from_slice(&0u16.to_be_bytes()); // min_version
     out.extend_from_slice(&0u16.to_be_bytes()); // writer_version
-    out.push(0x08); // common denominator, single channel, forward direction
-    out.extend_from_slice(&den.to_be_bytes());
-    out.extend_from_slice(&den.to_be_bytes()); // baseHdrHeadroom (log2 0 = no boost)
-    out.extend_from_slice(&((gain_max * den as f64).round() as u32).to_be_bytes()); // alternateHdrHeadroom
-    out.extend_from_slice(&0i32.to_be_bytes()); // gainMapMin
-    out.extend_from_slice(&((gain_max * den as f64).round() as i32).to_be_bytes()); // gainMapMax
-    out.extend_from_slice(&den.to_be_bytes()); // gainMapGamma = 1.0
-    out.extend_from_slice(&0i32.to_be_bytes()); // baseOffset
-    out.extend_from_slice(&0i32.to_be_bytes()); // alternateOffset
+    out.push(0x40); // use base colour space, single channel, forward direction
+    push_iso_fraction(&mut out, 0, den); // baseHdrHeadroom
+    push_iso_fraction(&mut out, head, den); // alternateHdrHeadroom
+    push_iso_fraction(&mut out, 0, den); // gainMapMin
+    push_iso_fraction(&mut out, head, den); // gainMapMax
+    push_iso_fraction(&mut out, den, den); // gainMapGamma = 1.0
+    push_iso_fraction(&mut out, 0, den); // baseOffset
+    push_iso_fraction(&mut out, 0, den); // alternateOffset
     Ok(out)
 }
 
@@ -1027,18 +1046,20 @@ fn ultrahdr_create_inner(base: &[u8], gainmap: &[u8], headroom: f64) -> Result<V
     if gainmap.len() < 4 || gainmap[0] != 0xFF || gainmap[1] != 0xD8 {
         return Err("gain map is not a JPEG".to_string());
     }
-    let iso = build_iso21496_1_payload(headroom)?;
+    let iso_params = build_iso21496_1_params_payload(headroom)?;
+    let iso_version = build_iso21496_1_version_payload();
 
-    // gain map image carries the full hdrgm metadata (XMP + ISO APP2); drop any
-    // stale copy so exactly one set survives
+    // gain map image carries the hdrgm metadata and the ISO 21496-1 parameters;
+    // drop any stale copy so exactly one set survives
     let mut gm = strip_hdr_metadata(gainmap);
-    let gm_ins: Vec<(u8, Vec<u8>)> = vec![(0xE1, build_secondary_xmp(headroom)), (0xE2, iso.clone())];
+    let gm_ins: Vec<(u8, Vec<u8>)> = vec![(0xE1, build_secondary_xmp(headroom)), (0xE2, iso_params)];
     let gm_at = jpeg_app_insert_pos(&gm);
     insert_segments(&mut gm, gm_at, &gm_ins);
 
-    // primary carries the container directory (lengths) + ISO APP2
+    // primary carries the container directory (lengths) + the version-only
+    // structural ISO marker (Apple/Google write no parameters here)
     let mut out = strip_hdr_metadata(base);
-    let base_ins: Vec<(u8, Vec<u8>)> = vec![(0xE1, build_primary_xmp(gm.len())), (0xE2, iso)];
+    let base_ins: Vec<(u8, Vec<u8>)> = vec![(0xE1, build_primary_xmp(gm.len())), (0xE2, iso_version)];
     let base_at = jpeg_app_insert_pos(&out);
     insert_segments(&mut out, base_at, &base_ins);
 
@@ -2850,6 +2871,28 @@ mod tests {
     }
 
     #[test]
+    fn iso_payload_matches_canonical_apple_layout() {
+        // body after the URN: versions(2+2), flags 0x40 (use base colour space,
+        // single channel, forward), then 7 numerator/denominator pairs with the
+        // power-of-two denominator 2^28. headroom 2.0 -> log2 boost 1.0.
+        let payload = build_iso21496_1_params_payload(2.0).unwrap();
+        let body = payload.strip_prefix(ISO21496_URN).unwrap();
+        assert_eq!(body.len(), 61, "same payload size as Apple gain-map APP2 bodies");
+        let den = ISO21496_DENOM;
+        let mut want = Vec::new();
+        want.extend_from_slice(&[0, 0, 0, 0]); // min/writer version
+        want.push(0x40); // use base colour space, single channel
+        for num in [0u32, den, 0, den, den, 0, 0] {
+            want.extend_from_slice(&num.to_be_bytes());
+            want.extend_from_slice(&den.to_be_bytes());
+        }
+        assert_eq!(body, want.as_slice());
+        let version = build_iso21496_1_version_payload();
+        assert_eq!(version.len(), ISO21496_URN.len() + 4);
+        assert_eq!(&version[ISO21496_URN.len()..], &[0, 0, 0, 0]);
+    }
+
+    #[test]
     fn ultrahdr_create_writes_consistent_metadata() {
         let Ok(src) = std::fs::read(GOOGLE_FIXTURE) else { eprintln!("SKIP: no google fixture"); return; };
         let (gm_abs, _) = gainmap_range(&src).unwrap();
@@ -2866,11 +2909,19 @@ mod tests {
             .expect("primary xmp");
         let text = String::from_utf8_lossy(xmp.payload);
         assert!(text.contains(&format!("Item:Length=\"{o_size}\"")), "container length must match");
+        // primary ISO marker is version-only: 36 byte segment like Apple's
+        let base_iso = jpeg_segments(&out)
+            .into_iter()
+            .find(|s| s.marker == 0xE2 && s.payload.starts_with(ISO21496_URN))
+            .expect("primary iso marker");
+        assert_eq!(base_iso.payload.len(), ISO21496_URN.len() + 4);
+        assert_eq!(&base_iso.payload[ISO21496_URN.len()..], &[0, 0, 0, 0]);
         // gain map carries parseable ISO + XMP metadata, neutral value 0
         let iso = jpeg_segments(out_gm)
             .into_iter()
             .find(|s| s.marker == 0xE2 && s.payload.starts_with(ISO21496_URN))
             .expect("iso payload");
+        assert_eq!(iso.payload[ISO21496_URN.len() + 4], 0x40, "canonical flags");
         let (multi, values) = iso_neutral_values(iso.payload).expect("iso parses");
         assert!(!multi);
         assert_eq!(values, [0, 0, 0]);
