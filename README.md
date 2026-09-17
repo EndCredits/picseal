@@ -23,7 +23,7 @@
 
 ### 图片生成
 
-基础路径通过 `dom-to-image` 将预览 DOM 转成 JPEG/PNG（等效屏幕截图，分辨率受预览尺寸限制），并可选将原图 EXIF 以二进制方式回嵌到 JPEG 输出中（实现较简单，不保证所有来源稳定）。
+SDR 输入（JPEG/WebP 等）默认按**原分辨率**合成：1:1 绘制原图 + 原生尺寸水印横幅，色域跟随源（JPEG 按 ICC 判定 P3/sRGB，输出带 ICC），可选回嵌原图 EXIF（方向已归一化）；超出浏览器 canvas 面积/边长上限时回退 `dom-to-image` 预览截图路径。PNG 与 HDR 输入走各自的 WASM 高保真管线（见下表）。
 
 ### 格式支持与导出路径
 
@@ -31,7 +31,7 @@
 
 | 输入 | 导出路径 | 输出 |
 | --- | --- | --- |
-| JPEG / PNG / WebP 等（SDR，浏览器可解码） | canvas（`dom-to-image`） | JPEG / PNG，可选回嵌 EXIF（仅 JPEG） |
+| JPEG / WebP 等（SDR，浏览器可解码） | canvas 原分辨率合成（1:1 原图 + 原生 banner，色域跟随源） | JPEG，可选回嵌 EXIF（仅 JPEG） |
 | PNG（任意位深，含 16bit） | WASM PNG：原分辨率解码重编码，iCCP/cICP/mDCv/cLLi/XMP/eXIf 等 chunk 字节级直通 | PNG |
 | HDR PNG（cICP PQ / HLG，或无 cICP 时按 mDCv/cLLi 判定） | 同上，水印按 BT.2408 参考白（PQ 203nit / HLG 75% 信号）与目标原色编码 | PNG（保留 cICP） |
 | Ultra HDR JPEG（gain map JPEG：主图带 hdrgm XMP 或 ISO 21496-1） | WASM Ultra HDR 组装：保留 gain map 与元数据、重写 MPF 目录，水印区域按中性增益（203nit） | Ultra HDR JPEG |

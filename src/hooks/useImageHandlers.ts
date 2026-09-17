@@ -8,7 +8,7 @@ import { useRef, useState } from 'react'
 import { appleHdrExport, appleHdrExportJpeg, probeAppleHdr } from '../utils/AppleHdrUtils'
 import { getBrandUrl } from '../utils/BrandUtils'
 import { decodeHeicToJpeg } from '../utils/HeicUtils'
-import { compositePngExport, dataURLtoBlob, getRandomImage, parseExifData, rasterizeDomToDataUrl } from '../utils/ImageUtils'
+import { compositeNativeExport, compositePngExport, dataURLtoBlob, getRandomImage, parseExifData, rasterizeDomToDataUrl } from '../utils/ImageUtils'
 import { embedExifRaw, extractExifRaw } from '../utils/JpegExifUtils'
 import { compositeUltraHdrExport } from '../utils/UltraHdrUtils'
 import { detect_hdr, get_exif } from '../wasm/gen_brand_photo_pictrue'
@@ -121,6 +121,10 @@ export function useImageHandlers(formRef: any, initialFormValue: ExifParamsForm)
   // 导出图片
   const handleDownload = async (exifEnable: boolean): Promise<void> => {
     const previewDom = document.getElementById('preview')
+    if (!previewDom) {
+      message.error('导出失败，请重试')
+      return
+    }
     const zoomRatio = 4
 
     try {
@@ -149,6 +153,13 @@ export function useImageHandlers(formRef: any, initialFormValue: ExifParamsForm)
       if (!downloadBlob && uploadImgType === 'image/png' && uploadFile) {
         console.log('wasm png composite export')
         downloadBlob = await compositePngExport(previewDom, uploadFile)
+      }
+
+      // 其余非 PNG 输入：原生分辨率 canvas 导出（1:1 原图 + 原生 banner），
+      // 超出 canvas 上限或失败时回退预览截图路径
+      if (!downloadBlob && uploadImgType !== 'image/png' && uploadFile) {
+        console.log('native resolution composite export')
+        downloadBlob = await compositeNativeExport(previewDom, uploadFile, exifEnable, exifBlob)
       }
 
       if (!downloadBlob) {

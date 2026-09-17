@@ -3,6 +3,7 @@ import domtoimage from 'dom-to-image'
 import moment from 'moment'
 import { composite_png } from '../wasm/gen_brand_photo_pictrue'
 import { BrandsList } from './BrandUtils'
+import { embedExifRaw } from './JpegExifUtils'
 
 export const DefaultPictureExif = {
   model: 'XIAOMI 13 ULTRA',
@@ -284,13 +285,18 @@ export async function buildBannerMask(previewDom: HTMLElement): Promise<BannerMa
     return null
   // 整幅预览按原生分辨率光栅化后裁剪 banner 区域：banner 元素单独光栅化在部分环境
   // （含 headless Chrome）会得到全透明结果，改走与 SDR 导出同源的全幅渲染更稳
+  const fullW = Math.max(1, Math.round(previewDom.clientWidth * scale))
+  const fullH = Math.max(1, Math.round(previewDom.clientHeight * scale))
   const fullUrl = await rasterizeDomToDataUrl(previewDom, {
     format: 'png',
-    width: Math.max(1, Math.round(previewDom.clientWidth * scale)),
-    height: Math.max(1, Math.round(previewDom.clientHeight * scale)),
+    width: fullW,
+    height: fullH,
     style: { transform: `scale(${scale})`, transformOrigin: 'top left' },
   })
   const fullImg = await loadImage(fullUrl)
+  // 浏览器因 canvas 面积上限静默缩小画布（移动端）时 mask 会错位，交由调用方回退
+  if (fullImg.naturalWidth !== fullW || fullImg.naturalHeight !== fullH)
+    return null
   const canvas = document.createElement('canvas')
   canvas.width = width
   canvas.height = height
@@ -398,6 +404,68 @@ export async function compositePngExport(previewDom: HTMLElement, file: File): P
   }
   catch (e) {
     console.warn('WASM PNG composite failed, falling back to canvas path:', e)
+    return null
+  }
+}
+
+// 原生分辨率 canvas 导出（JPEG/WebP 等浏览器可解码输入）：以 1:1 绘制原图 +
+// 原生分辨率 banner mask（buildBannerMask），色域跟随源（JPEG 按 ICC 启发式判定
+// P3/sRGB）；超出 canvas 面积/边长上限或浏览器静默缩小画布时返回 null，由调用方
+// 回退预览截图路径
+const NATIVE_EXPORT_MAX_PIXELS = 64 * 1024 * 1024
+const NATIVE_EXPORT_MAX_SIDE = 16384
+
+export async function compositeNativeExport(
+  previewDom: HTMLElement,
+  file: File,
+  exifEnable: boolean,
+  exifBlob: Blob | null,
+): Promise<Blob | null> {
+  try {
+    const img = previewDom.querySelector('.preview-picture') as HTMLImageElement | null
+    if (!img || !img.complete || !img.naturalWidth || !img.naturalHeight)
+      return null
+    const mask = await buildBannerMask(previewDom)
+    if (!mask)
+      return null
+
+    const W = img.naturalWidth
+    const H = Math.max(img.naturalHeight, mask.offY + mask.height)
+    if (W * H > NATIVE_EXPORT_MAX_PIXELS || W > NATIVE_EXPORT_MAX_SIDE || H > NATIVE_EXPORT_MAX_SIDE) {
+      console.log('native resolution export skipped: canvas limit', `${W}x${H}`)
+      return null
+    }
+    let wide = true
+    if (/jpe?g/i.test(file.type) || /\.jpe?g$/i.test(file.name)) {
+      try {
+        wide = jpegGuessWideGamut(new Uint8Array(await file.arrayBuffer()))
+      }
+      catch {
+        wide = true
+      }
+    }
+    const canvas = createExportCanvas(W, H, wide)
+    // 浏览器因面积/尺寸上限静默缩小画布（移动端）时回退
+    if (canvas.width !== W || canvas.height !== H) {
+      console.log('native resolution export skipped: canvas clamped', `${canvas.width}x${canvas.height}`)
+      return null
+    }
+    const ctx = canvas.getContext('2d')
+    if (!ctx)
+      return null
+    ctx.fillStyle = '#fff'
+    ctx.fillRect(0, 0, W, H)
+    ctx.drawImage(img, 0, 0)
+    const bannerImg = await loadImage(mask.url)
+    ctx.drawImage(bannerImg, mask.offX, mask.offY, mask.width, mask.height)
+    const blob = await new Promise<Blob | null>(resolve => canvas.toBlob(resolve, 'image/jpeg', 1.0))
+    if (!blob)
+      return null
+    console.log('native resolution export done:', `${W}x${H}, wide=${wide}, ${blob.size}B`)
+    return exifEnable && exifBlob ? embedExifRaw(exifBlob, blob) : blob
+  }
+  catch (e) {
+    console.warn('native resolution export failed, falling back to preview screenshot:', e)
     return null
   }
 }
