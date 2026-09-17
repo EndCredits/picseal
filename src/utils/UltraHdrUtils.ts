@@ -1,7 +1,7 @@
 import type { BannerMask } from './ImageUtils'
 import { ultrahdr_assemble, ultrahdr_gainmap, ultrahdr_neutral } from '../wasm/gen_brand_photo_pictrue'
-import { buildBannerMask, createExportCanvas, jpegGuessWideGamut, loadImage } from './ImageUtils'
-import { embedExifRaw } from './JpegExifUtils'
+import { buildBannerMask, createExportCanvas, grayThumb, jpegGuessWideGamut, loadImage, orientGainMap } from './ImageUtils'
+import { embedExifRaw, readExifOrientation } from './JpegExifUtils'
 
 interface NeutralInfo {
   ok: boolean
@@ -16,12 +16,13 @@ function toBlobJpeg(canvas: HTMLCanvasElement, quality: number): Promise<Blob | 
 // 横幅区域 gain map 置中性增益（log2 boost 0 → HDR 重构下维持 SDR 白 ≈203nit）；
 // 横幅在照片下方时延展 gain map 画布（中性填充），保证照片区 HDR 对齐；
 // 解码不做色彩转换，保证 gain map 采样值不被 ICC 改写
-async function neutralizeGainMap(gainMap: Uint8Array, mask: BannerMask, baseW: number, baseH: number, neutral: NeutralInfo): Promise<Uint8Array> {
-  const bitmap = await createImageBitmap(new Blob([gainMap], { type: 'image/jpeg' }), { colorSpaceConversion: 'none' })
-  const gw = bitmap.width
-  const gh = bitmap.height
+async function neutralizeGainMap(gainMap: Uint8Array, mask: BannerMask, baseW: number, baseH: number, neutral: NeutralInfo, exifOrientation: number, baseThumb: Float32Array | null): Promise<Uint8Array> {
+  const bitmap = await createImageBitmap(new Blob([gainMap], { type: 'image/jpeg' }), { colorSpaceConversion: 'none', imageOrientation: 'none' })
+  const oriented = orientGainMap(bitmap, mask.naturalWidth, mask.naturalHeight, baseThumb, exifOrientation)
+  bitmap.close()
+  const gw = oriented.width
+  const gh = oriented.height
   if (!gw || !gh) {
-    bitmap.close()
     return gainMap
   }
   const outW = Math.max(1, Math.round(gw * baseW / mask.naturalWidth))
@@ -31,14 +32,12 @@ async function neutralizeGainMap(gainMap: Uint8Array, mask: BannerMask, baseW: n
   canvas.height = outH
   const ctx = canvas.getContext('2d', { colorSpace: 'srgb', willReadFrequently: true })
   if (!ctx) {
-    bitmap.close()
     return gainMap
   }
   const [r, g, b] = neutral.values
   ctx.fillStyle = `rgb(${r},${g},${b})`
   ctx.fillRect(0, 0, outW, outH)
-  ctx.drawImage(bitmap, 0, 0, gw, gh)
-  bitmap.close()
+  ctx.drawImage(oriented.canvas, 0, 0, gw, gh)
   const bx = Math.max(0, Math.round(mask.offX * outW / baseW))
   const by = Math.max(0, Math.round(mask.offY * outH / baseH))
   const bw = Math.min(outW - bx, Math.round(mask.width * outW / baseW))
@@ -89,6 +88,8 @@ export async function compositeUltraHdrExport(
     bitmap.close()
     const maskImg = await loadImage(mask.url)
     ctx.drawImage(maskImg, mask.offX, mask.offY, mask.width, mask.height)
+    // 缩略图取照片区域（不含横幅），避免横幅的白色拉高相关性
+    const baseThumb = grayThumb(canvas, mask.naturalWidth, mask.naturalHeight)
     let baseBlob = await toBlobJpeg(canvas, 0.95)
     if (!baseBlob)
       return null
@@ -96,7 +97,7 @@ export async function compositeUltraHdrExport(
       baseBlob = embedExifRaw(exifBlob, baseBlob)
 
     const gainMapFinal = neutral?.ok
-      ? await neutralizeGainMap(gainMap, mask, W, H, neutral)
+      ? await neutralizeGainMap(gainMap, mask, W, H, neutral, readExifOrientation(original), baseThumb)
       : gainMap
 
     const assembled = ultrahdr_assemble(original, new Uint8Array(await baseBlob.arrayBuffer()), gainMapFinal)

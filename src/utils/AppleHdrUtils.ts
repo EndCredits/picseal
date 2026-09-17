@@ -5,8 +5,8 @@ import type { HeicDecodeResult } from './HeicUtils'
 import type { BannerMask } from './ImageUtils'
 import { apple_hdr_compose_png, apple_hdr_iso_gainmap, apple_jpeg_headroom, heic_apple_info, ultrahdr_create, ultrahdr_gainmap } from '../wasm/gen_brand_photo_pictrue'
 import { decodeAppleHdrLayers } from './HeicUtils'
-import { buildBannerMask, createExportCanvas, jpegGuessWideGamut, loadImage } from './ImageUtils'
-import { embedExifRaw } from './JpegExifUtils'
+import { buildBannerMask, createExportCanvas, grayThumb, jpegGuessWideGamut, loadImage, orientGainMap } from './ImageUtils'
+import { embedExifRaw, readExifOrientation } from './JpegExifUtils'
 
 export interface AppleHdrInfo {
   ok: boolean
@@ -165,22 +165,20 @@ export async function appleJpegHdrExportJpeg(
     bitmap.close()
     const maskImg = await loadImage(mask.url)
     ctx.drawImage(maskImg, mask.offX, mask.offY, mask.width, mask.height)
+    // 缩略图取照片区域（不含横幅），避免横幅的白色拉高相关性
+    const baseThumb = grayThumb(canvas, mask.naturalWidth, mask.naturalHeight)
 
-    // gain map：不做色彩转换解码，保证 Apple 采样值不被 ICC 改写
+    // gain map：不做色彩转换解码（imageOrientation 'none'）保证 Apple 采样值不被
+    // ICC/EXIF 改写；浏览器绘制 base 时会应用其 EXIF 方向，gain map 需手动跟随
     const gainMap = ultrahdr_gainmap(bytes)
-    const gmBitmap = await createImageBitmap(new Blob([new Uint8Array(gainMap)], { type: 'image/jpeg' }), { colorSpaceConversion: 'none' })
-    const gmW = gmBitmap.width
-    const gmH = gmBitmap.height
-    const gmCanvas = document.createElement('canvas')
-    gmCanvas.width = gmW
-    gmCanvas.height = gmH
-    const gmCtx = gmCanvas.getContext('2d', { colorSpace: 'srgb', willReadFrequently: true })
-    if (!gmCtx) {
-      gmBitmap.close()
-      return null
-    }
-    gmCtx.drawImage(gmBitmap, 0, 0)
+    const gmBitmap = await createImageBitmap(new Blob([new Uint8Array(gainMap)], { type: 'image/jpeg' }), { colorSpaceConversion: 'none', imageOrientation: 'none' })
+    const oriented = orientGainMap(gmBitmap, mask.naturalWidth, mask.naturalHeight, baseThumb, readExifOrientation(bytes))
     gmBitmap.close()
+    const gmW = oriented.width
+    const gmH = oriented.height
+    const gmCtx = oriented.canvas.getContext('2d', { colorSpace: 'srgb', willReadFrequently: true })
+    if (!gmCtx)
+      return null
     const gmData = gmCtx.getImageData(0, 0, gmW, gmH).data
 
     const blob = await assembleAppleHdrJpeg(canvas, mask, W, H, gmData, gmW, gmH, headroom)

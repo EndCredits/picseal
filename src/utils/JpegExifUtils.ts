@@ -37,6 +37,53 @@ function normalizeExifOrientation(app1: Uint8Array): void {
   }
 }
 
+// 读取 APP1 IFD0 的 Orientation（缺省、结构异常均按 1 处理）
+export function readExifOrientation(raw: Uint8Array): number {
+  try {
+    if (raw.length < TIFF_OFFSET + 8)
+      return 1
+    const dv = new DataView(raw.buffer, raw.byteOffset, raw.byteLength)
+    if (dv.getUint16(0) !== JPEG)
+      return 1
+    let off = 2
+    while (off + 4 <= raw.length) {
+      const marker = dv.getUint16(off)
+      if (marker === SOS)
+        break
+      const size = dv.getUint16(off + 2)
+      if (size < 2)
+        break
+      if (marker === APP1 && off + 8 <= raw.length && dv.getUint32(off + 4) === EXIF) {
+        const app1 = raw.subarray(off, off + 2 + size)
+        if (app1.length < TIFF_OFFSET + 8)
+          return 1
+        const little = app1[TIFF_OFFSET] === 0x49
+        const big = app1[TIFF_OFFSET] === 0x4D
+        if (!little && !big)
+          return 1
+        const tdv = new DataView(app1.buffer, app1.byteOffset, app1.byteLength)
+        const ifd = TIFF_OFFSET + tdv.getUint32(TIFF_OFFSET + 4, little)
+        if (ifd + 2 > app1.length)
+          return 1
+        const count = tdv.getUint16(ifd, little)
+        for (let i = 0; i < count; i++) {
+          const entry = ifd + 2 + i * 12
+          if (entry + 12 > app1.length)
+            return 1
+          if (tdv.getUint16(entry, little) === ORIENTATION_TAG && tdv.getUint16(entry + 2, little) === 3)
+            return tdv.getUint16(entry + 8, little) || 1
+        }
+        return 1
+      }
+      off += 2 + size
+    }
+  }
+  catch {
+    // 结构异常按 1 处理
+  }
+  return 1
+}
+
 export function extractExifRaw(raw: Blob): Promise<Blob> {
   return new Promise((resolve, reject) => {
     const reader = new FileReader()

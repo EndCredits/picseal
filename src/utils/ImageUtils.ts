@@ -373,6 +373,141 @@ export function pngHdrTransfer(bytes: Uint8Array): 'pq' | 'hlg' | null {
   return sawStaticHdr ? 'pq' : null
 }
 
+// 按 EXIF Orientation（1..8）把位图绘到新画布；1 或未知值直接返回原方向。
+// 用于 gain map 与 base 的方向对齐：浏览器绘制 base 时会应用其 EXIF 方向，
+// 而 gain map（第二图/aux item）通常不带方向信息，必须手动跟随
+export function drawExifOriented(src: ImageBitmap, orientation: number): HTMLCanvasElement {
+  const sw = src.width
+  const sh = src.height
+  const swap = orientation > 4
+  const canvas = document.createElement('canvas')
+  canvas.width = swap ? sh : sw
+  canvas.height = swap ? sw : sh
+  const ctx = canvas.getContext('2d', { colorSpace: 'srgb', willReadFrequently: true })
+  if (!ctx)
+    throw new Error('Failed to get 2d context')
+  // 变换矩阵取自 blueimp/JavaScript-Load-Image 的成熟实现
+  switch (orientation) {
+    case 2:
+      ctx.transform(-1, 0, 0, 1, sw, 0)
+      break
+    case 3:
+      ctx.transform(-1, 0, 0, -1, sw, sh)
+      break
+    case 4:
+      ctx.transform(1, 0, 0, -1, 0, sh)
+      break
+    case 5:
+      ctx.transform(0, 1, 1, 0, 0, 0)
+      break
+    case 6:
+      ctx.transform(0, 1, -1, 0, sh, 0)
+      break
+    case 7:
+      ctx.transform(0, -1, -1, 0, sh, sw)
+      break
+    case 8:
+      ctx.transform(0, -1, 1, 0, 0, sw)
+      break
+    default:
+      break
+  }
+  ctx.drawImage(src, 0, 0)
+  return canvas
+}
+
+// 粗网格灰度缩略（用于方向判定的相关性比较）：取 source 左上角 sw×sh 区域，
+// 即 base 画布的照片区（横幅不计入，避免白色区域干扰相关性）
+export function grayThumb(source: CanvasImageSource, sw: number, sh: number, n = 24): Float32Array {
+  const canvas = document.createElement('canvas')
+  canvas.width = n
+  canvas.height = n
+  const ctx = canvas.getContext('2d', { colorSpace: 'srgb', willReadFrequently: true })
+  if (!ctx)
+    return new Float32Array(0)
+  ctx.drawImage(source, 0, 0, sw, sh, 0, 0, n, n)
+  const d = ctx.getImageData(0, 0, n, n).data
+  const out = new Float32Array(n * n)
+  for (let i = 0; i < out.length; i++)
+    out[i] = (d[i * 4] * 0.299 + d[i * 4 + 1] * 0.587 + d[i * 4 + 2] * 0.114) / 255
+  return out
+}
+
+function grayCorrelation(a: Float32Array, b: Float32Array): number {
+  if (!a.length || a.length !== b.length)
+    return -2
+  let ma = 0
+  let mb = 0
+  for (let i = 0; i < a.length; i++) {
+    ma += a[i]
+    mb += b[i]
+  }
+  ma /= a.length
+  mb /= b.length
+  let num = 0
+  let da = 0
+  let db = 0
+  for (let i = 0; i < a.length; i++) {
+    const x = a[i] - ma
+    const y = b[i] - mb
+    num += x * y
+    da += x * x
+    db += y * y
+  }
+  return da > 0 && db > 0 ? num / Math.sqrt(da * db) : -2
+}
+
+export interface OrientedGainMap {
+  canvas: HTMLCanvasElement
+  width: number
+  height: number
+}
+
+// gain map 方向校正：先按 base 的 EXIF 方向（JPEG 输入）旋正；若宽高比仍与 base
+// 转置（libheif 未对 aux 图应用 irot、或其他来源缺少方向信息），则用 gain map 与
+// base 亮度的相关性在 90°/270° 中判向（gain map 高值区通常对应 base 高光）
+export function orientGainMap(gm: ImageBitmap, baseW: number, baseH: number, baseThumb: Float32Array | null, exifOrientation = 1): OrientedGainMap {
+  let canvas = drawExifOriented(gm, exifOrientation)
+  let width = canvas.width
+  let height = canvas.height
+  const a = width / height
+  const b = baseW / baseH
+  // 容差 20%：横幅延展/历史导出文件的轻微形变会让宽高比偏离几到十几个百分点
+  const transposed = Math.abs(a - 1 / b) / (1 / b) < 0.2 && Math.abs(a - b) / b > 0.2
+  if (transposed && baseThumb?.length) {
+    const c90 = drawExifOriented(gm, 6)
+    const c270 = drawExifOriented(gm, 8)
+    const r90 = grayCorrelation(baseThumb, grayThumb(c90, c90.width, c90.height))
+    const r270 = grayCorrelation(baseThumb, grayThumb(c270, c270.width, c270.height))
+    console.log(`gain map orientation: base ${baseW}x${baseH} vs gain map ${width}x${height} transposed, correlation 90°=${r90.toFixed(3)} 270°=${r270.toFixed(3)}`)
+    if (r90 >= r270) {
+      canvas = c90
+    }
+    else {
+      canvas = c270
+    }
+    width = canvas.width
+    height = canvas.height
+  }
+  return { canvas, width, height }
+}
+
+// 从 RGBA 像素（Apple HDR HEIC 的 libheif 输出）取粗网格灰度缩略
+export function grayThumbFromRgba(data: Uint8ClampedArray, w: number, h: number, n = 24): Float32Array {
+  const out = new Float32Array(n * n)
+  if (!w || !h)
+    return out
+  for (let y = 0; y < n; y++) {
+    for (let x = 0; x < n; x++) {
+      const sx = Math.min(w - 1, Math.floor((x + 0.5) * w / n))
+      const sy = Math.min(h - 1, Math.floor((y + 0.5) * h / n))
+      const i = (sy * w + sx) * 4
+      out[y * n + x] = (data[i] * 0.299 + data[i + 1] * 0.587 + data[i + 2] * 0.114) / 255
+    }
+  }
+  return out
+}
+
 // PNG 高保真导出：WASM 原分辨率合成，保留位深与全部元数据 chunk；
 // 不适用（palette/APNG）或失败时返回 null，由调用方回退 canvas 路径
 export async function compositePngExport(previewDom: HTMLElement, file: File): Promise<Blob | null> {
