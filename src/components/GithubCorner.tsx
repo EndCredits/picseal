@@ -3,7 +3,7 @@ import React from 'react'
 function GithubCorner() {
   return (
     <a
-      href="https://github.com/zhiweio/picseal"
+      href="https://github.com/EndCredits/picseal"
       className="github-corner"
       aria-label="View source on GitHub"
     >

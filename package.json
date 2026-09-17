@@ -4,10 +4,10 @@
   "version": "0.0.0",
   "private": true,
   "author": "Wang Zhiwei <noparking188@gmail.com>",
-  "homepage": "https://github.com/zhiwei/picseal.git",
+  "homepage": "https://github.com/EndCredits/picseal.git",
   "repository": {
     "type": "git",
-    "url": "https://github.com/zhiwei/picseal.git"
+    "url": "https://github.com/EndCredits/picseal.git"
   },
   "scripts": {
     "build:wasm": "node scripts/build-wasm.js",
