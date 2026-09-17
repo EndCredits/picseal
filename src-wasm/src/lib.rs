@@ -752,6 +752,11 @@ fn ultrahdr_neutral_inner(raw: &[u8]) -> NeutralInfo {
             }
         }
     }
+    // Apple 风格 gain map JPEG（无 hdrgm/ISO 元数据）：Apple 采样值 0 即无增益
+    // （比例 1+(H-1)·g），中性值可直接取 0
+    if iso_payloads.is_empty() && xmp_payloads.is_empty() && apple_jpeg_headroom_inner(raw) > 1.0 {
+        return NeutralInfo { ok: true, multi_channel: false, values: [0; 3] };
+    }
     for payload in iso_payloads {
         if let Some((multi, values)) = iso_neutral_values(payload) {
             return NeutralInfo { ok: true, multi_channel: multi, values };
@@ -1448,6 +1453,54 @@ fn heic_apple_info_inner(raw: &[u8]) -> AppleHeicInfo {
 pub fn heic_apple_info(raw: Vec<u8>) -> JsValue {
     let info = heic_apple_info_inner(&raw);
     <wasm_bindgen::JsValue as JsValueSerdeExt>::from_serde(&info).unwrap()
+}
+
+// ---- Apple 风格 gain map JPEG（iOS 上传转码 / Photos 导出）----
+// 主图不带 hdrgm / ISO 21496-1 标记，gain map 图带 Apple 私有 XMP
+// （HDRGainMap，新格式含 HDRGainMapHeadroom）或 Exif MakerNote（旧格式 tag 33/48）。
+// 数值口径与 Apple HDR HEIC 相同（gain map 采样 g → 比例 1+(H-1)·srgb_eotf(g)），
+// 可复用 apple_hdr_iso_gainmap 转成 ISO 数值后按规范布局重建元数据。
+
+fn xmp_apple_headroom(payload: &[u8]) -> Option<f64> {
+    let needle = b"HDRGainMap:HDRGainMapHeadroom";
+    let i = find_sub(payload, needle)?;
+    let rest = payload.get(i + needle.len()..i + needle.len() + 64)?;
+    let text = String::from_utf8_lossy(rest);
+    let num: String = text
+        .chars()
+        .skip_while(|c| !c.is_ascii_digit() && *c != '-' && *c != '.')
+        .take_while(|c| c.is_ascii_digit() || *c == '.' || *c == '-')
+        .collect();
+    num.parse::<f64>().ok()
+}
+
+fn apple_jpeg_headroom_inner(raw: &[u8]) -> f64 {
+    // 新格式：headroom 写在 gain map 图的 XMP 里
+    if let Some((abs, size)) = gainmap_range(raw) {
+        let end = (abs + size).min(raw.len());
+        for s in jpeg_segments(&raw[abs..end]) {
+            if s.marker == 0xE1 && s.payload.starts_with(XMP_SIG) {
+                if let Some(h) = xmp_apple_headroom(s.payload) {
+                    if h.is_finite() && h > 1.0 {
+                        return h;
+                    }
+                }
+            }
+        }
+    }
+    // 旧格式：headroom 由 Exif MakerNote 推导
+    if let Some((hr, gain)) = apple_makernote_values(raw) {
+        let h = apple_headroom(hr, gain);
+        if h.is_finite() && h > 1.0 {
+            return h;
+        }
+    }
+    0.0
+}
+
+#[wasm_bindgen]
+pub fn apple_jpeg_headroom(raw: Vec<u8>) -> f64 {
+    apple_jpeg_headroom_inner(&raw)
 }
 
 // Display P3 -> BT.2020 linear (D65); row sums = 1 so white is preserved
@@ -2644,6 +2697,31 @@ mod tests {
         if ran == 0 {
             eprintln!("SKIP: no local samples in test_pictures/");
         }
+    }
+
+    #[test]
+    fn apple_jpeg_gainmap_headroom_and_neutral() {
+        // 新格式：headroom 在 gain map 图 XMP（HDRGainMap:HDRGainMapHeadroom）
+        let Ok(new_fmt) = std::fs::read("../test_pictures/apple_gainmap_new.jpg") else {
+            eprintln!("SKIP: no apple gain map jpeg fixture");
+            return;
+        };
+        let h = apple_jpeg_headroom_inner(&new_fmt);
+        assert!((h - 4.532783).abs() < 1e-6, "new fmt headroom {h}");
+        let neutral = ultrahdr_neutral_inner(&new_fmt);
+        assert!(neutral.ok, "apple jpeg neutral must be resolved");
+        assert!(!neutral.multi_channel);
+        assert_eq!(neutral.values, [0, 0, 0]);
+        // 旧格式：XMP 无 headroom，回退 Exif MakerNote（tag 33/48 推导）
+        if let Ok(old_fmt) = std::fs::read("../test_pictures/apple_gainmap_old.jpg") {
+            let h = apple_jpeg_headroom_inner(&old_fmt);
+            assert!(h > 1.0 && h.is_finite(), "old fmt headroom {h}");
+            assert!(ultrahdr_neutral_inner(&old_fmt).ok);
+        }
+        // JPEG 普通图不应被误判
+        let sdr = jpeg_with_xmp("<x:xmpmeta/>");
+        assert_eq!(apple_jpeg_headroom_inner(&sdr), 0.0);
+        assert!(!ultrahdr_neutral_inner(&sdr).ok);
     }
 
     // ---- HDR PNG watermark mapping tests ----

@@ -5,7 +5,7 @@ import type { AppleHdrInfo } from '../utils/AppleHdrUtils'
 import type { HeicDecodeResult } from '../utils/HeicUtils'
 import { message } from 'antd'
 import { useRef, useState } from 'react'
-import { appleHdrExport, appleHdrExportJpeg, probeAppleHdr } from '../utils/AppleHdrUtils'
+import { appleHdrExport, appleHdrExportJpeg, appleJpegHdrExportJpeg, probeAppleHdr } from '../utils/AppleHdrUtils'
 import { getBrandUrl } from '../utils/BrandUtils'
 import { decodeHeicToJpeg } from '../utils/HeicUtils'
 import { compositeNativeExport, compositePngExport, dataURLtoBlob, getRandomImage, parseExifData, rasterizeDomToDataUrl } from '../utils/ImageUtils'
@@ -21,6 +21,8 @@ export function useImageHandlers(formRef: any, initialFormValue: ExifParamsForm)
   const [uploadFile, setUploadFile] = useState<RcFile | null>(null)
   const [exifBlob, setExifBlob] = useState<Blob | null>(null)
   const [hdrGainMapJpeg, setHdrGainMapJpeg] = useState(false)
+  // Apple 风格 gain map JPEG（iOS 上传 HEIC 的转码结构）：导出走 Apple JPEG HDR 路径
+  const [appleJpegGainMap, setAppleJpegGainMap] = useState(false)
   const [appleHdr, setAppleHdr] = useState<AppleHdrInfo | null>(null)
   // Apple HDR 导出格式：Ultra HDR JPEG（默认，体积小）或 16bit PQ PNG（保真）
   const [hdrFormat, setHdrFormat] = useState<'ultrahdr' | 'png'>('ultrahdr')
@@ -72,14 +74,19 @@ export function useImageHandlers(formRef: any, initialFormValue: ExifParamsForm)
         }
 
         const gainMapJpeg = !!hdrInfo?.is_hdr && hdrInfo.kind === 'jpeg-gainmap'
+        // Apple 风格 gain map JPEG（主图无 hdrgm/ISO 标记）：iOS 上传 HEIC 时的转码结果即此结构
+        const appleJpegGainMap = !!hdrInfo?.is_hdr && hdrInfo.kind === 'apple-gainmap'
         const hdrPng = !!hdrInfo?.is_hdr && file.type === 'image/png' && hdrInfo.kind.startsWith('png-')
         setHdrGainMapJpeg(gainMapJpeg)
+        setAppleJpegGainMap(appleJpegGainMap)
         if (wasmDecodedHeic)
           message.info(`当前浏览器不支持 HEIC，已用内置解码器转为 SDR 预览（${wasmDecodedHeic.width}×${wasmDecodedHeic.height}，${wasmDecodedHeic.ms}ms）${appleInfo ? '；导出可重建 HDR（Ultra HDR JPEG / 16bit PQ PNG 可选）' : hdrInfo?.is_hdr ? '；导出将丢失 HDR' : ''}`, 5)
         else if (appleInfo)
           message.info(`检测到 Apple HDR HEIC：导出可重建 HDR，默认 Ultra HDR JPEG，可选 16bit PQ PNG（headroom ${appleInfo.headroom.toFixed(2)}×）`, 5)
         else if (gainMapJpeg)
           message.info('检测到 HDR（gain map JPEG）：导出将保留 HDR，水印区域按 SDR 白处理', 5)
+        else if (appleJpegGainMap)
+          message.info('检测到 Apple 风格 HDR JPEG（gain map 在第二图，iOS 上传/相册导出的结构）：导出将保留 HDR，水印区域按 SDR 白处理', 5)
         else if (hdrPng && hdrInfo.kind !== 'png-hlg')
           message.info('检测到 HDR PNG（PQ）：导出保留 HDR，水印按 203nit / 目标原色映射', 5)
         else if (hdrPng)
@@ -147,6 +154,12 @@ export function useImageHandlers(formRef: any, initialFormValue: ExifParamsForm)
       if (!downloadBlob && (uploadImgType === 'image/jpeg' || uploadImgType === 'image/jpg') && hdrGainMapJpeg && uploadFile) {
         console.log('wasm ultrahdr composite export')
         downloadBlob = await compositeUltraHdrExport(previewDom, uploadFile, exifEnable, exifBlob)
+      }
+
+      // Apple 风格 gain map JPEG：Apple 数值 → ISO 数值 + 规范元数据重建（同 Apple HDR HEIC 路径）
+      if (!downloadBlob && (uploadImgType === 'image/jpeg' || uploadImgType === 'image/jpg') && appleJpegGainMap && uploadFile) {
+        console.log('wasm apple jpeg hdr export')
+        downloadBlob = await appleJpegHdrExportJpeg(previewDom, uploadFile, exifEnable, exifBlob)
       }
 
       // PNG 输入优先走 WASM 高保真管线（原分辨率/位深/元数据保留）

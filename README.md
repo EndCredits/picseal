@@ -37,7 +37,8 @@ SDR 输入（JPEG/WebP 等）默认按**原分辨率**合成：1:1 绘制原图 
 | Ultra HDR JPEG（gain map JPEG：主图带 hdrgm XMP 或 ISO 21496-1） | WASM Ultra HDR 组装：保留 gain map 与元数据、重写 MPF 目录，水印区域按中性增益（203nit） | Ultra HDR JPEG |
 | Apple HDR HEIC（iPhone 拍摄） | 解析 gain map item 与 Apple MakerNote headroom，按 Apple 公式重建 HDR | Ultra HDR JPEG（默认，体积约 PQ PNG 的 1/6～1/12）或 16bit PQ PNG（可选，保真度最高） |
 | HEIC（SDR / 非 Apple HDR） | 浏览器原生不支持 HEIC 时经 libheif WASM 按需解码 | JPEG |
-| 其他 HDR 输入（Apple 私有风格 gain map JPEG、AVIF 等） | canvas | SDR（上传时提示 HDR 将丢失） |
+| Apple 风格 gain map JPEG（iOS 上传 HEIC 时的转码结果、相册导出的 HDR JPEG） | Apple 数值 → ISO 数值 + 规范元数据重建（同 Apple HDR HEIC 路径） | Ultra HDR JPEG |
+| 其他 HDR 输入（AVIF 等） | canvas | SDR（上传时提示 HDR 将丢失） |
 
 Ultra HDR JPEG 输出的 ISO 21496-1 元数据采用 Apple / Google 实际文件的规范布局（主图为 version-only 结构标记，参数在 gain map 内以分子/分母对序列化）：实测 Apple 相册正确显示 HDR（ImageIO / CoreImage 校验），并与 Google/Android Ultra HDR 及 Chrome 的解析约定一致。
 
