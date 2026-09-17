@@ -23,15 +23,23 @@
 
 ### 图片生成
 
-导出的图片是通过 `dom-to-image` JavaScript 库来将 DOM 转 JPEG/PNG 等格式图片，请注意这种实现生成的是和原图完全不一样的图片，可以看作屏幕截图的方式。
+基础路径通过 `dom-to-image` 将预览 DOM 转成 JPEG/PNG（等效屏幕截图，分辨率受预览尺寸限制），并可选将原图 EXIF 以二进制方式回嵌到 JPEG 输出中（实现较简单，不保证所有来源稳定）。
 
-目前针对 JPEG 格式图片新增了复制原图 EXIF 信息嵌进导出的图片中，目前的实现方式比较简单粗暴，直接从原图二进制数据提取 EXIF 部分的数据，再同样以二进制格式进行拼接，不能确保稳定。
+### 格式支持与导出路径
 
-此外，针对以下输入提供了 Rust/WASM 高保真导出路径（保留原始分辨率与 HDR）：
+针对常见格式（尤其是 HDR）提供了 Rust/WASM 高保真导出路径，按原分辨率重建水印并保留原始元数据：
 
-- 16bit PNG：原分辨率解码/重编码，元数据 chunk 字节级直通；PQ/HLG 源的水印按 BT.2408 参考白（203nit / 75% 信号）与目标原色编码
-- Ultra HDR（gain map JPEG）：保留 gain map 与 ISO 21496-1 / XMP 元数据，重写 MPF 目录，水印区域按中性增益（203nit）处理
-- Apple HDR HEIC：解析 gain map item 与 Apple MakerNote headroom，重建 HDR 并导出 Ultra HDR JPEG（默认，体积约为 PQ PNG 的 1/6～1/12，Apple 相册/Android/Chrome 通用）或 16bit PQ PNG（可选，保真度最高）
+| 输入 | 导出路径 | 输出 |
+| --- | --- | --- |
+| JPEG / PNG / WebP 等（SDR，浏览器可解码） | canvas（`dom-to-image`） | JPEG / PNG，可选回嵌 EXIF（仅 JPEG） |
+| PNG（任意位深，含 16bit） | WASM PNG：原分辨率解码重编码，iCCP/cICP/mDCv/cLLi/XMP/eXIf 等 chunk 字节级直通 | PNG |
+| HDR PNG（cICP PQ / HLG，或无 cICP 时按 mDCv/cLLi 判定） | 同上，水印按 BT.2408 参考白（PQ 203nit / HLG 75% 信号）与目标原色编码 | PNG（保留 cICP） |
+| Ultra HDR JPEG（gain map JPEG：主图带 hdrgm XMP 或 ISO 21496-1） | WASM Ultra HDR 组装：保留 gain map 与元数据、重写 MPF 目录，水印区域按中性增益（203nit） | Ultra HDR JPEG |
+| Apple HDR HEIC（iPhone 拍摄） | 解析 gain map item 与 Apple MakerNote headroom，按 Apple 公式重建 HDR | Ultra HDR JPEG（默认，体积约 PQ PNG 的 1/6～1/12）或 16bit PQ PNG（可选，保真度最高） |
+| HEIC（SDR / 非 Apple HDR） | 浏览器原生不支持 HEIC 时经 libheif WASM 按需解码 | JPEG |
+| 其他 HDR 输入（Apple 私有风格 gain map JPEG、AVIF 等） | canvas | SDR（上传时提示 HDR 将丢失） |
+
+Ultra HDR JPEG 输出的 ISO 21496-1 元数据采用 Apple / Google 实际文件的规范布局（主图为 version-only 结构标记，参数在 gain map 内以分子/分母对序列化）：实测 Apple 相册正确显示 HDR（ImageIO / CoreImage 校验），并与 Google/Android Ultra HDR 及 Chrome 的解析约定一致。
 
 ### 改进
 
@@ -127,7 +135,7 @@ HDR 相关能力（Ultra HDR gain map JPEG、Apple HDR HEIC、PQ/HLG PNG）的�
 
 ### 参考实现（算法与格式）
 
-- [libultrahdr](https://github.com/google/libultrahdr)（Google，MIT / Apache-2.0）：Ultra HDR / gain map JPEG 参考编解码器。本项目的 MPF 目录布局、gain map 应用数学（`affineMapGain` / `applyGain`）与 ISO 21496-1 元数据解析均参照其实现
+- [libultrahdr](https://github.com/google/libultrahdr)（Google，MIT / Apache-2.0）：Ultra HDR / gain map JPEG 参考编解码器。本项目的 MPF 目录布局、gain map 应用数学（`affineMapGain` / `applyGain`）与 ISO 21496-1 元数据解析均参照其实现；ISO 21496-1 写入侧改用 Apple / Google 实际文件的规范布局（主图 version-only 标记 + gain map 分子/分母对、flags=0x40），libultrahdr 草案的公共分母形式会被 Apple/Chrome 解析失败并丢弃 gain map
 - [apple-hdr-heic](https://github.com/johncf/apple-hdr-heic)（johncf，MIT）：Apple HDR HEIC 的 gain map 重建方案。本项目的 headroom 推导（Apple MakerNote 分段公式）与重建公式（sRGB EOTF → BT.2020 → PQ 量化，参考白 203nit）即移植自此
 - [gainmap-js](https://github.com/MONOGRID/gainmap-js)（MONOGRID，MIT）：MPF/JPEG 零依赖重组的思路参考
 
@@ -135,6 +143,7 @@ HDR 相关能力（Ultra HDR gain map JPEG、Apple HDR HEIC、PQ/HLG PNG）的�
 
 - [exiftool](https://exiftool.org/)（Phil Harvey）：推导并校验 Apple MakerNote 的 HDRHeadroom/HDRGain 参考值
 - [libultrahdr](https://github.com/google/libultrahdr) 的 `ultrahdr_app`：Ultra HDR 组装输出经其解码做逐字节回归验证
+- macOS ImageIO / CoreImage（Swift 脚本 + `kCIImageExpandToHDR`）：Apple 侧「相册是否显示 HDR」的验收 oracle——`CGImageSourceCopyAuxiliaryDataInfoAtIndex` 检查 gain map 识别，CoreImage 渲染检查增益实际生效
 - [apple-hdr-heic](https://github.com/johncf/apple-hdr-heic) CLI + [OpenCV](https://opencv.org/) + [colour-science](https://www.colour-science.org/)：Apple HDR 重建结果与参考实现做像素级对比
 
 ## 作者
