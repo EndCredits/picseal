@@ -27,6 +27,12 @@
 
 目前针对 JPEG 格式图片新增了复制原图 EXIF 信息嵌进导出的图片中，目前的实现方式比较简单粗暴，直接从原图二进制数据提取 EXIF 部分的数据，再同样以二进制格式进行拼接，不能确保稳定。
 
+此外，针对以下输入提供了 Rust/WASM 高保真导出路径（保留原始分辨率与 HDR）：
+
+- 16bit PNG：原分辨率解码/重编码，元数据 chunk 字节级直通；PQ/HLG 源的水印按 BT.2408 参考白（203nit / 75% 信号）与目标原色编码
+- Ultra HDR（gain map JPEG）：保留 gain map 与 ISO 21496-1 / XMP 元数据，重写 MPF 目录，水印区域按中性增益（203nit）处理
+- Apple HDR HEIC：解析 gain map item 与 Apple MakerNote headroom，重建 HDR 并导出 16bit PQ PNG
+
 ### 改进
 
 - [ ] 改用 Rust `little_exif` 库来实现对图片 EXIF 信息的读取和编辑。
@@ -108,6 +114,28 @@
    ```
 
 3. 访问 http://localhost:8080
+
+## 致谢
+
+HDR 相关能力（Ultra HDR gain map JPEG、Apple HDR HEIC、PQ/HLG PNG）的实现离不开以下开源项目，在此致谢：
+
+### 运行时依赖
+
+- [libheif](https://github.com/strukturag/libheif) / [libde265](https://github.com/strukturag/libde265)（LGPL-3.0）：HEIC 解码。经 [libheif-js](https://github.com/catdad-experiments/libheif-js)（LGPL-3.0）编译为 WASM，仅在浏览器原生不支持 HEIC 时按需加载（独立文件、可替换）
+- [kamadak-exif](https://github.com/kamadak/exif-rs)（BSD-2-Clause）：Rust 侧 EXIF 读取
+- Rust/WASM 生态：[png](https://github.com/image-rs/image-png)、[crc32fast](https://github.com/srijs/rust-crc32fast)、[serde](https://serde.rs)、[wasm-bindgen](https://github.com/rustwasm/wasm-bindgen)、[gloo-utils](https://github.com/rustwasm/gloo)（均为 MIT / Apache-2.0）
+
+### 参考实现（算法与格式）
+
+- [libultrahdr](https://github.com/google/libultrahdr)（Google，MIT / Apache-2.0）：Ultra HDR / gain map JPEG 参考编解码器。本项目的 MPF 目录布局、gain map 应用数学（`affineMapGain` / `applyGain`）与 ISO 21496-1 元数据解析均参照其实现
+- [apple-hdr-heic](https://github.com/johncf/apple-hdr-heic)（johncf，MIT）：Apple HDR HEIC 的 gain map 重建方案。本项目的 headroom 推导（Apple MakerNote 分段公式）与重建公式（sRGB EOTF → BT.2020 → PQ 量化，参考白 203nit）即移植自此
+- [gainmap-js](https://github.com/MONOGRID/gainmap-js)（MONOGRID，MIT）：MPF/JPEG 零依赖重组的思路参考
+
+### 验证工具（非运行时依赖）
+
+- [exiftool](https://exiftool.org/)（Phil Harvey）：推导并校验 Apple MakerNote 的 HDRHeadroom/HDRGain 参考值
+- [libultrahdr](https://github.com/google/libultrahdr) 的 `ultrahdr_app`：Ultra HDR 组装输出经其解码做逐字节回归验证
+- [apple-hdr-heic](https://github.com/johncf/apple-hdr-heic) CLI + [OpenCV](https://opencv.org/) + [colour-science](https://www.colour-science.org/)：Apple HDR 重建结果与参考实现做像素级对比
 
 ## 作者
 
