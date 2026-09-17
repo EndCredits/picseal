@@ -62,8 +62,10 @@ export async function compositeUltraHdrExport(
   try {
     const mask = await buildBannerMask(previewDom)
     // 横幅超出照片宽度的布局不支持（当前设计不会出现）
-    if (!mask || mask.offX < 0 || mask.offX + mask.width > mask.naturalWidth)
+    if (!mask || mask.offX < 0 || mask.offX + mask.width > mask.naturalWidth) {
+      console.warn('Ultra HDR export skipped: banner mask outside photo bounds', mask ? { offX: mask.offX, width: mask.width, naturalWidth: mask.naturalWidth } : null)
       return null
+    }
 
     const W = mask.naturalWidth
     const H = Math.max(mask.naturalHeight, mask.offY + mask.height)

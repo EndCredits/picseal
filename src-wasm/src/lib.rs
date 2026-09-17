@@ -59,6 +59,13 @@ fn contains(data: &[u8], needle: &[u8]) -> bool {
     needle.len() <= data.len() && data.windows(needle.len()).any(|w| w == needle)
 }
 
+fn find_sub(data: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() || needle.len() > data.len() {
+        return None;
+    }
+    data.windows(needle.len()).position(|w| w == needle)
+}
+
 // Locate the ISO-BMFF 'meta' box payload range (skips box header + fullbox version/flags)
 fn bmff_meta_range(raw: &[u8]) -> Option<(usize, usize)> {
     let mut off = 0usize;
@@ -377,6 +384,57 @@ fn has_segment(raw: &[u8], marker: u8, payload: &[u8]) -> bool {
     jpeg_segments(raw).iter().any(|s| s.marker == marker && s.payload == payload)
 }
 
+// The Google container directory (XMP) declares the embedded gain map item
+// with Item:Length. The packet is carried verbatim from the source, so after a
+// re-encode the declared value would describe the original bytes. Rewrite it to
+// the gain map that is actually attached.
+fn patch_container_gainmap_length(xmp: &mut Vec<u8>, new_len: usize) {
+    let Some(sem) = find_sub(xmp, b"Semantic=\"GainMap\"") else { return };
+    let Some(rel) = find_sub(&xmp[sem..], b"Length=\"") else { return };
+    let start = sem + rel + b"Length=\"".len();
+    let Some(quote) = xmp[start..].iter().position(|&b| b == b'"') else { return };
+    let end = start + quote;
+    let new = new_len.to_string();
+    if xmp[start..end] != *new.as_bytes() {
+        xmp.splice(start..end, new.into_bytes());
+    }
+}
+
+fn patch_xmp_in_jpeg(jpeg: &mut Vec<u8>, new_len: usize) {
+    let mut off = 2usize;
+    while off + 4 <= jpeg.len() {
+        if jpeg[off] != 0xFF {
+            break;
+        }
+        let m = jpeg[off + 1];
+        if m == 0xDA || m == 0xD9 {
+            break;
+        }
+        if m == 0x01 || (0xD0..=0xD7).contains(&m) {
+            off += 2;
+            continue;
+        }
+        let len = u16::from_be_bytes([jpeg[off + 2], jpeg[off + 3]]) as usize;
+        if len < 2 || off + 2 + len > jpeg.len() {
+            break;
+        }
+        let start = off + 4;
+        let end = off + 2 + len;
+        if jpeg[start..].starts_with(XMP_SIG) {
+            let mut payload = jpeg[start..end].to_vec();
+            patch_container_gainmap_length(&mut payload, new_len);
+            let delta = payload.len() as isize - (end - start) as isize;
+            jpeg.splice(start..end, payload);
+            if delta != 0 {
+                let new_field = (len as isize + delta) as u16;
+                jpeg[off + 2..off + 4].copy_from_slice(&new_field.to_be_bytes());
+            }
+            return;
+        }
+        off = end;
+    }
+}
+
 // HDR metadata segments: XMP carrying hdrgm, ISO 21496-1 APP2, optionally ICC
 fn hdr_carry_segments(raw: &[u8], include_icc: bool) -> Vec<(u8, Vec<u8>)> {
     let mut out: Vec<(u8, Vec<u8>)> = Vec::new();
@@ -448,6 +506,61 @@ fn gainmap_range(raw: &[u8]) -> Option<(usize, usize)> {
                 return Some((abs, size));
             }
         }
+    }
+    // MPF offsets can be stale (editors rewrite the metadata segments or
+    // re-encode the base without patching them). Fall back to the second
+    // concatenated JPEG, which is how libultrahdr's decoder and Apple locate
+    // the gain map.
+    sequential_gainmap_range(raw)
+}
+
+// Walk a JPEG from `start` through its EOI; returns the index just past EOI.
+// Segment payloads are skipped by length, so embedded thumbnails are ignored;
+// in entropy data only stuffed 0xFF00, RSTn markers and EOI appear, and
+// progressive scans (extra SOS) are walked like any other segment.
+fn jpeg_image_end(raw: &[u8], start: usize) -> Option<usize> {
+    if start + 2 > raw.len() || raw[start] != 0xFF || raw[start + 1] != 0xD8 {
+        return None;
+    }
+    let mut off = start + 2;
+    while off + 1 < raw.len() {
+        if raw[off] != 0xFF {
+            off += 1;
+            continue;
+        }
+        let m = raw[off + 1];
+        if m == 0x00 || (0xD0..=0xD7).contains(&m) {
+            off += 2;
+            continue;
+        }
+        if m == 0xD9 {
+            return Some(off + 2);
+        }
+        if m == 0x01 {
+            off += 2;
+            continue;
+        }
+        if off + 4 > raw.len() {
+            return None;
+        }
+        let len = u16::from_be_bytes([raw[off + 2], raw[off + 3]]) as usize;
+        if len < 2 || off + 2 + len > raw.len() {
+            return None;
+        }
+        off += 2 + len;
+    }
+    None
+}
+
+fn sequential_gainmap_range(raw: &[u8]) -> Option<(usize, usize)> {
+    let primary_end = jpeg_image_end(raw, 0)?;
+    let mut p = primary_end;
+    while p + 3 < raw.len() {
+        if raw[p] == 0xFF && raw[p + 1] == 0xD8 && raw[p + 2] == 0xFF && raw[p + 3] != 0x00 {
+            let end = jpeg_image_end(raw, p).unwrap_or(raw.len());
+            return Some((p, end - p));
+        }
+        p += 1;
     }
     None
 }
@@ -736,6 +849,7 @@ fn ultrahdr_assemble_inner(original: &[u8], base: &[u8], gainmap: &[u8]) -> Resu
         .collect();
     let base_at = jpeg_app_insert_pos(&out);
     insert_segments(&mut out, base_at, &base_ins);
+    patch_xmp_in_jpeg(&mut out, gm.len());
 
     let mpf_at = jpeg_app_insert_pos(&out);
     let base_total_len = out.len() + MPF_MARKER_LEN;
@@ -2700,6 +2814,62 @@ mod tests {
             let _ = ultrahdr_gainmap_inner(&src[..cut]);
             let _ = ultrahdr_neutral_inner(&src[..cut]);
         }
+    }
+
+    #[test]
+    fn ultrahdr_gainmap_stale_mpf_falls_back_to_sequential_scan() {
+        const FIXTURE: &str = "../test_pictures/IMG_9678.JPG";
+        let Ok(src) = std::fs::read(FIXTURE) else { eprintln!("SKIP: no stale-mpf fixture"); return; };
+        // this file's MPF declares an offset 1000 bytes past the real SOI
+        assert!(mpf_second_image_stale(&src), "fixture no longer exercises the stale path");
+        let (abs, size) = gainmap_range(&src).unwrap();
+        assert_eq!(&src[abs..abs + 2], &[0xFF, 0xD8]);
+        assert_eq!(size, 108450);
+        assert_eq!(abs + size, src.len());
+        let gm = ultrahdr_gainmap_inner(&src).unwrap();
+        assert_eq!(&gm[..2], &[0xFF, 0xD8]);
+        assert_eq!(&gm[gm.len() - 2..], &[0xFF, 0xD9]);
+        let info = ultrahdr_neutral_inner(&src);
+        assert!(info.ok || !info.multi_channel);
+    }
+
+    fn mpf_second_image_stale(src: &[u8]) -> bool {
+        for s in jpeg_segments(src) {
+            if s.marker != 0xE2 {
+                continue;
+            }
+            if let Some((off, _)) = mpf_second_image(s.payload) {
+                let abs = s.start + 8 + off;
+                return !(abs + 2 <= src.len() && src[abs] == 0xFF && src[abs + 1] == 0xD8);
+            }
+        }
+        false
+    }
+
+    #[test]
+    fn ultrahdr_assemble_patches_container_gainmap_length() {
+        const FIXTURE: &str = "../test_pictures/IMG_9678.JPG";
+        let Ok(src) = std::fs::read(FIXTURE) else { eprintln!("SKIP: no stale-mpf fixture"); return; };
+        let (gm_abs, gm_size) = gainmap_range(&src).unwrap();
+        let mut gm = src[gm_abs..gm_abs + gm_size].to_vec();
+        // grow the gain map so a stale container length cannot coincide
+        let payload = b"picseal-gm-pad";
+        let mut com = vec![0xFF, 0xFE];
+        com.extend_from_slice(&((payload.len() + 2) as u16).to_be_bytes());
+        com.extend_from_slice(payload);
+        gm.splice(gm.len() - 2..gm.len() - 2, com);
+
+        let out = ultrahdr_assemble_inner(&src, &src[..gm_abs], &gm).unwrap();
+        let (o_abs, o_size) = gainmap_range(&out).unwrap();
+        assert_eq!(o_size, gm.len());
+        assert_eq!(&out[o_abs..o_abs + 2], &[0xFF, 0xD8]);
+        let xmp = jpeg_segments(&out)
+            .into_iter()
+            .find(|s| s.marker == 0xE1 && s.payload.starts_with(XMP_SIG))
+            .expect("xmp carried into base");
+        let text = String::from_utf8_lossy(xmp.payload);
+        let excerpt = text.find("Semantic=\"GainMap\"").map(|i| text[i..(i + 160).min(text.len())].to_string()).unwrap_or_else(|| "no GainMap item".to_string());
+        assert!(text.contains(&format!("Length=\"{}\"", gm.len())), "container gain map length must match the attached image (len={}); item: {}", gm.len(), excerpt);
     }
 
     #[test]
