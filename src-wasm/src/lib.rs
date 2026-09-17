@@ -876,6 +876,191 @@ pub fn ultrahdr_assemble(original: Vec<u8>, base: Vec<u8>, gainmap: Vec<u8>) -> 
     ultrahdr_assemble_inner(&original, &base, &gainmap).map_err(|e| JsValue::from_str(&e))
 }
 
+// ---- Ultra HDR creation from scratch (Apple HDR HEIC -> gain map JPEG) ----
+// Writes the ISO 21496-1 APP2 payload (libultrahdr `encodeGainmapMetadata`
+// layout, common denominator form, single channel, gamma 1) plus the hdrgm
+// XMP, then assembles base + gain map with a freshly computed MPF directory.
+
+const ISO21496_DENOM: u32 = 1_000_000;
+
+// boost factor is `2^(log2(headroom) * v)` for the normalized sample v, so the
+// Apple gain map value maps to v = log2(1 + (headroom-1) * srgb_eotf(g)) / log2(headroom)
+fn build_iso21496_1_payload(headroom: f64) -> Result<Vec<u8>, String> {
+    if !headroom.is_finite() || headroom <= 1.0 {
+        return Err("invalid headroom".to_string());
+    }
+    let gain_max = headroom.log2();
+    let den = ISO21496_DENOM;
+    let mut out = Vec::with_capacity(ISO21496_URN.len() + 4 + 1 + 4 * 8);
+    out.extend_from_slice(ISO21496_URN);
+    out.extend_from_slice(&0u16.to_be_bytes()); // min_version
+    out.extend_from_slice(&0u16.to_be_bytes()); // writer_version
+    out.push(0x08); // common denominator, single channel, forward direction
+    out.extend_from_slice(&den.to_be_bytes());
+    out.extend_from_slice(&den.to_be_bytes()); // baseHdrHeadroom (log2 0 = no boost)
+    out.extend_from_slice(&((gain_max * den as f64).round() as u32).to_be_bytes()); // alternateHdrHeadroom
+    out.extend_from_slice(&0i32.to_be_bytes()); // gainMapMin
+    out.extend_from_slice(&((gain_max * den as f64).round() as i32).to_be_bytes()); // gainMapMax
+    out.extend_from_slice(&den.to_be_bytes()); // gainMapGamma = 1.0
+    out.extend_from_slice(&0i32.to_be_bytes()); // baseOffset
+    out.extend_from_slice(&0i32.to_be_bytes()); // alternateOffset
+    Ok(out)
+}
+
+fn build_secondary_xmp(headroom: f64) -> Vec<u8> {
+    let gain_max = headroom.log2();
+    let xml = format!(
+        "<?xpacket begin=\"\u{feff}\" id=\"W5M0MpCehiHzreSzNTczkc9d\"?>\n\
+<x:xmpmeta xmlns:x=\"adobe:ns:meta/\" x:xmptk=\"XMP Core 5.5.0\">\n \
+<rdf:RDF xmlns:rdf=\"http://www.w3.org/1999/02/22-rdf-syntax-ns#\">\n  \
+<rdf:Description rdf:about=\"\"\n    \
+xmlns:hdrgm=\"http://ns.adobe.com/hdr-gain-map/1.0/\"\n   \
+hdrgm:Version=\"1.0\"\n   \
+hdrgm:GainMapMin=\"0.000000\"\n   \
+hdrgm:GainMapMax=\"{gain_max:.6}\"\n   \
+hdrgm:HDRCapacityMin=\"0.000000\"\n   \
+hdrgm:HDRCapacityMax=\"{gain_max:.6}\"\n   \
+hdrgm:OffsetSDR=\"0.000000\"\n   \
+hdrgm:OffsetHDR=\"0.000000\"/>\n \
+</rdf:RDF>\n\
+</x:xmpmeta>\n       \n\
+<?xpacket end=\"w\"?>"
+    );
+    let mut out = Vec::with_capacity(XMP_SIG.len() + 1 + xml.len());
+    out.extend_from_slice(XMP_SIG);
+    out.push(0);
+    out.extend_from_slice(xml.as_bytes());
+    out
+}
+
+// Drops hdrgm XMP / ISO 21496-1 / MPF segments so freshly generated metadata
+// cannot collide with a stale copy carried by the input.
+fn strip_hdr_metadata(raw: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(raw.len());
+    if raw.len() < 2 {
+        return raw.to_vec();
+    }
+    out.extend_from_slice(&raw[..2]);
+    let mut off = 2usize;
+    while off + 4 <= raw.len() {
+        if raw[off] != 0xFF {
+            break;
+        }
+        let marker = raw[off + 1];
+        if marker == 0xDA || marker == 0xD9 {
+            break;
+        }
+        if marker == 0x01 || (0xD0..=0xD7).contains(&marker) {
+            off += 2;
+            continue;
+        }
+        let len = u16::from_be_bytes([raw[off + 2], raw[off + 3]]) as usize;
+        if len < 2 || off + 2 + len > raw.len() {
+            break;
+        }
+        let payload = &raw[off + 4..off + 2 + len];
+        let drop = (marker == 0xE1 && payload.starts_with(XMP_SIG) && contains(payload, b"hdrgm:"))
+            || (marker == 0xE2 && (payload.starts_with(ISO21496_URN) || payload.starts_with(b"MPF\0")));
+        if !drop {
+            out.extend_from_slice(&raw[off..off + 2 + len]);
+        }
+        off += 2 + len;
+    }
+    out.extend_from_slice(&raw[off..]);
+    out
+}
+
+fn build_primary_xmp(gainmap_len: usize) -> Vec<u8> {
+    let xml = format!(
+        "<x:xmpmeta xmlns:x=\"adobe:ns:meta/\" x:xmptk=\"Adobe XMP Core 5.1.2\">\n  \
+<rdf:RDF xmlns:rdf=\"http://www.w3.org/1999/02/22-rdf-syntax-ns#\">\n    \
+<rdf:Description\n        \
+xmlns:Container=\"http://ns.google.com/photos/1.0/container/\"\n        \
+xmlns:Item=\"http://ns.google.com/photos/1.0/container/item/\"\n        \
+xmlns:hdrgm=\"http://ns.adobe.com/hdr-gain-map/1.0/\"\n        \
+hdrgm:Version=\"1.0\">\n      \
+<Container:Directory>\n        \
+<rdf:Seq>\n          \
+<rdf:li rdf:parseType=\"Resource\">\n            \
+<Container:Item\n             Item:Semantic=\"Primary\"\n             Item:Mime=\"image/jpeg\"/>\n          \
+</rdf:li>\n          \
+<rdf:li rdf:parseType=\"Resource\">\n            \
+<Container:Item\n             Item:Semantic=\"GainMap\"\n             Item:Mime=\"image/jpeg\"\n             Item:Length=\"{gainmap_len}\"/>\n          \
+</rdf:li>\n        \
+</rdf:Seq>\n      \
+</Container:Directory>\n    \
+</rdf:Description>\n  \
+</rdf:RDF>\n\
+</x:xmpmeta>"
+    );
+    let mut out = Vec::with_capacity(XMP_SIG.len() + 1 + xml.len());
+    out.extend_from_slice(XMP_SIG);
+    out.push(0);
+    out.extend_from_slice(xml.as_bytes());
+    out
+}
+
+fn apple_hdr_iso_gainmap_inner(gainmap: &[u8], gm_w: usize, gm_h: usize, headroom: f64) -> Result<Vec<u8>, String> {
+    if gm_w == 0 || gm_h == 0 || gainmap.len() < gm_w * gm_h * 4 {
+        return Err("bad gain map".to_string());
+    }
+    if !headroom.is_finite() || headroom <= 1.0 {
+        return Err("invalid headroom".to_string());
+    }
+    let srgb = SrgbEotf::new();
+    let denom = headroom.log2();
+    let scale_range = headroom - 1.0;
+    let mut out = vec![0u8; gm_w * gm_h];
+    for (i, o) in out.iter_mut().enumerate() {
+        let g = gainmap[i * 4] as f64 / 255.0;
+        let ratio = 1.0 + scale_range * srgb.eval(g);
+        let v = ratio.log2() / denom;
+        *o = (v.clamp(0.0, 1.0) * 255.0 + 0.5).floor() as u8;
+    }
+    Ok(out)
+}
+
+fn ultrahdr_create_inner(base: &[u8], gainmap: &[u8], headroom: f64) -> Result<Vec<u8>, String> {
+    if base.len() < 4 || base[0] != 0xFF || base[1] != 0xD8 {
+        return Err("base is not a JPEG".to_string());
+    }
+    if gainmap.len() < 4 || gainmap[0] != 0xFF || gainmap[1] != 0xD8 {
+        return Err("gain map is not a JPEG".to_string());
+    }
+    let iso = build_iso21496_1_payload(headroom)?;
+
+    // gain map image carries the full hdrgm metadata (XMP + ISO APP2); drop any
+    // stale copy so exactly one set survives
+    let mut gm = strip_hdr_metadata(gainmap);
+    let gm_ins: Vec<(u8, Vec<u8>)> = vec![(0xE1, build_secondary_xmp(headroom)), (0xE2, iso.clone())];
+    let gm_at = jpeg_app_insert_pos(&gm);
+    insert_segments(&mut gm, gm_at, &gm_ins);
+
+    // primary carries the container directory (lengths) + ISO APP2
+    let mut out = strip_hdr_metadata(base);
+    let base_ins: Vec<(u8, Vec<u8>)> = vec![(0xE1, build_primary_xmp(gm.len())), (0xE2, iso)];
+    let base_at = jpeg_app_insert_pos(&out);
+    insert_segments(&mut out, base_at, &base_ins);
+
+    let mpf_at = jpeg_app_insert_pos(&out);
+    let base_total_len = out.len() + MPF_MARKER_LEN;
+    let gm_offset = base_total_len - (mpf_at + 8);
+    let mpf = build_mpf_segment(base_total_len, gm.len(), gm_offset);
+    out.splice(mpf_at..mpf_at, mpf);
+    out.extend_from_slice(&gm);
+    Ok(out)
+}
+
+#[wasm_bindgen]
+pub fn apple_hdr_iso_gainmap(gainmap: Vec<u8>, gm_w: usize, gm_h: usize, headroom: f64) -> Result<Vec<u8>, JsValue> {
+    apple_hdr_iso_gainmap_inner(&gainmap, gm_w, gm_h, headroom).map_err(|e| JsValue::from_str(&e))
+}
+
+#[wasm_bindgen]
+pub fn ultrahdr_create(base: Vec<u8>, gainmap: Vec<u8>, headroom: f64) -> Result<Vec<u8>, JsValue> {
+    ultrahdr_create_inner(&base, &gainmap, headroom).map_err(|e| JsValue::from_str(&e))
+}
+
 // ---- HEIC / Apple HDR gain map ----
 // Container parsing to locate the gain map item (Apple aux `auxl`+`auxC` URN or
 // ISO 21496-1 `tmap`) plus the Apple MakerNote headroom. The actual gain map
@@ -2640,6 +2825,69 @@ mod tests {
             .map(|s| s.payload.to_vec())
             .unwrap();
         assert_eq!(out_icc, orig_icc, "original HDR intent profile must survive");
+    }
+
+    #[test]
+    fn apple_iso_gainmap_round_trips_through_iso_formula() {
+        let headroom = 4.915774637972608_f64; // IMG_9519
+        let srgb = SrgbEotf::new();
+        let denom = headroom.log2();
+        let samples: [u8; 5] = [0, 64, 128, 192, 255];
+        let mut rgba = Vec::new();
+        for s in samples {
+            rgba.extend_from_slice(&[s, s, s, 255]);
+        }
+        let iso = apple_hdr_iso_gainmap_inner(&rgba, samples.len(), 1, headroom).unwrap();
+        assert_eq!(iso.len(), samples.len());
+        assert_eq!(iso[0], 0);
+        assert_eq!(iso[4], 255);
+        for (s, v) in samples.iter().zip(iso.iter()) {
+            let want = 1.0 + (headroom - 1.0) * srgb.eval(*s as f64 / 255.0);
+            let got = 2f64.powf(denom * (*v as f64 / 255.0));
+            let rel = (got - want).abs() / want;
+            assert!(rel < 0.01, "sample {s}: want {want} got {got}");
+        }
+    }
+
+    #[test]
+    fn ultrahdr_create_writes_consistent_metadata() {
+        let Ok(src) = std::fs::read(GOOGLE_FIXTURE) else { eprintln!("SKIP: no google fixture"); return; };
+        let (gm_abs, _) = gainmap_range(&src).unwrap();
+        let gm = ultrahdr_gainmap_inner(&src).unwrap();
+        let out = ultrahdr_create_inner(&src[..gm_abs], &gm, 2.0).unwrap();
+        assert_eq!(&out[..2], &[0xFF, 0xD8]);
+        let (o_abs, o_size) = gainmap_range(&out).unwrap();
+        let out_gm = &out[o_abs..o_abs + o_size];
+        assert_eq!(&out_gm[..2], &[0xFF, 0xD8]);
+        // primary container directory declares the attached gain map length
+        let xmp = jpeg_segments(&out)
+            .into_iter()
+            .find(|s| s.marker == 0xE1 && s.payload.starts_with(XMP_SIG))
+            .expect("primary xmp");
+        let text = String::from_utf8_lossy(xmp.payload);
+        assert!(text.contains(&format!("Item:Length=\"{o_size}\"")), "container length must match");
+        // gain map carries parseable ISO + XMP metadata, neutral value 0
+        let iso = jpeg_segments(out_gm)
+            .into_iter()
+            .find(|s| s.marker == 0xE2 && s.payload.starts_with(ISO21496_URN))
+            .expect("iso payload");
+        let (multi, values) = iso_neutral_values(iso.payload).expect("iso parses");
+        assert!(!multi);
+        assert_eq!(values, [0, 0, 0]);
+        let gm_xmp = jpeg_segments(out_gm)
+            .into_iter()
+            .find(|s| s.marker == 0xE1 && s.payload.starts_with(XMP_SIG) && contains(s.payload, b"hdrgm:"))
+            .expect("gm xmp");
+        let (_, xvalues) = xmp_neutral_values(gm_xmp.payload).expect("xmp parses");
+        assert_eq!(xvalues, [0, 0, 0]);
+    }
+
+    #[test]
+    fn ultrahdr_create_rejects_bad_input() {
+        let jpeg = [0xFF, 0xD8, 0xFF, 0xD9];
+        assert!(ultrahdr_create_inner(&jpeg, &jpeg, 1.0).is_err());
+        assert!(ultrahdr_create_inner(&jpeg, &jpeg, 2.0).is_ok());
+        assert!(ultrahdr_create_inner(&[0x00, 0x00], &jpeg, 2.0).is_err());
     }
 
     // ---- Apple HDR (HEIC) tests ----

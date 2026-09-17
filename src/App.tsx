@@ -22,7 +22,7 @@ export const IconFont = createFromIconfontCN({
 
 function App() {
   const formRef = useRef()
-  const { imgRef, imgUrl, setImgUrl, formValue, setFormValue, handleAdd, handleDownload, handleFormChange, handleFontSizeChange, handleFontWeightChange, handleFontFamilyChange, handleScaleChange, handleExhibitionClick } = useImageHandlers(formRef, DefaultPictureExif)
+  const { appleHdr, hdrFormat, setHdrFormat, imgRef, imgUrl, setImgUrl, formValue, setFormValue, handleAdd, handleDownload, handleFormChange, handleFontSizeChange, handleFontWeightChange, handleFontFamilyChange, handleScaleChange, handleExhibitionClick } = useImageHandlers(formRef, DefaultPictureExif)
   const [wasmLoaded, setWasmLoaded] = useState(false)
   const [exifEnable, setExifEnable] = useState(false)
 
@@ -194,6 +194,17 @@ function App() {
               />
             </Tooltip>
           </Flex>
+          {appleHdr && (
+            <Flex wrap gap="small" horizontal="true" justify="flex-start" align="center" style={{ marginBottom: 12 }}>
+              <Typography.Text className="switch-title">HDR 格式</Typography.Text>
+              <Tooltip placement="topLeft" title="Ultra HDR JPEG：体积小（约 PNG 的 1/20），Apple 相册/Android/Chrome 通用；PQ PNG：16bit 高保真，体积大">
+                <Select value={hdrFormat} style={{ width: 190 }} onChange={value => setHdrFormat(value)}>
+                  <Select.Option value="ultrahdr">Ultra HDR JPEG（推荐）</Select.Option>
+                  <Select.Option value="png">PQ PNG（16bit）</Select.Option>
+                </Select>
+              </Tooltip>
+            </Flex>
+          )}
           <Form
             ref={formRef}
             labelCol={{ span: 4 }}

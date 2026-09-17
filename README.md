@@ -31,7 +31,7 @@
 
 - 16bit PNG：原分辨率解码/重编码，元数据 chunk 字节级直通；PQ/HLG 源的水印按 BT.2408 参考白（203nit / 75% 信号）与目标原色编码
 - Ultra HDR（gain map JPEG）：保留 gain map 与 ISO 21496-1 / XMP 元数据，重写 MPF 目录，水印区域按中性增益（203nit）处理
-- Apple HDR HEIC：解析 gain map item 与 Apple MakerNote headroom，重建 HDR 并导出 16bit PQ PNG
+- Apple HDR HEIC：解析 gain map item 与 Apple MakerNote headroom，重建 HDR 并导出 Ultra HDR JPEG（默认，体积约为 PQ PNG 的 1/6～1/12，Apple 相册/Android/Chrome 通用）或 16bit PQ PNG（可选，保真度最高）
 
 ### 改进
 
