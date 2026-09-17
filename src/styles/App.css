@@ -195,24 +195,30 @@
     transform: translateY(-2px); /* Lift effect on hover */
 }
 
-/* Input and Select Styles */
-.ant-input,
-.ant-select-selector {
+/* Input / Select 统一样式：同高同内边距，避免输入框与下拉框高低、宽度不齐 */
+.props-option .ant-input,
+.props-option .ant-select.ant-select-sm.ant-select-single .ant-select-selector {
+    height: 44px;
+    padding: 10px 11px;
     border-radius: 8px; /* Rounded corners for inputs and selects */
     border: 1px solid #d9d9d9; /* Light gray border */
     transition: border-color 0.3s ease, box-shadow 0.3s ease; /* Smooth transition for focus effects */
-    padding: 10px; /* Increased padding for better usability */
 }
 
-.ant-input:focus,
-.ant-select-selector:focus {
+/* 外层 Select 容器同高（selector 为 height:100%） */
+.props-option .ant-select.ant-select-sm.ant-select-single {
+    height: 44px;
+}
+
+.props-option .ant-input:focus,
+.props-option .ant-select-focused .ant-select-selector {
     border-color: #007bff; /* Blue border on focus */
     box-shadow: 0 0 0 2px rgba(0, 123, 255, 0.2); /* Subtle blue shadow on focus */
 }
 
-/* Slider Styles */
-.ant-slider {
-    margin-top: 8px; /* Space above the slider */
+/* Slider Styles：轨道宽度与输入框对齐 */
+.props-option .ant-slider {
+    margin: 8px 0 11px;
 }
 
 /* Typography Styles */
@@ -232,12 +238,6 @@
 }
 
 /* Switch Styles */
-.switch-title {
-    color: #aaa; /* Light gray color for the title */
-    font-family: var(--current-font-family), system-ui;
-    font-size: 12px; /* Font size for the title */
-}
-
 .ant-switch {
     border-radius: 20px; /* Rounded corners for a modern look */
     background-color: #e0e0e0; /* Light gray background color */

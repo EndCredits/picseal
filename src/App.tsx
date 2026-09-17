@@ -185,36 +185,34 @@ function App() {
           <Typography.Title level={4}>参数</Typography.Title>
         </div>
         <div className="props-option">
-          <Flex wrap gap="small" horizontal="true" justify="flex-start" align="center">
-            <Typography.Text className="switch-title">导出 EXIF</Typography.Text>
-            <Tooltip placement="topLeft" title="实验性功能：嵌入原图 EXIF 信息至导出图片，只支持 JPEG">
-              <Switch
-                defaultChecked={exifEnable}
-                onClick={() => setExifEnable(!exifEnable)}
-              />
-            </Tooltip>
-          </Flex>
-          {appleHdr && (
-            <Flex wrap gap="small" horizontal="true" justify="flex-start" align="center" style={{ marginBottom: 12 }}>
-              <Typography.Text className="switch-title">HDR 格式</Typography.Text>
-              <Tooltip placement="topLeft" title="Ultra HDR JPEG：体积小（约 PNG 的 1/20），Apple 相册/Android/Chrome 通用；PQ PNG：16bit 高保真，体积大">
-                <Select value={hdrFormat} style={{ width: 190 }} onChange={value => setHdrFormat(value)}>
-                  <Select.Option value="ultrahdr">Ultra HDR JPEG（推荐）</Select.Option>
-                  <Select.Option value="png">PQ PNG（16bit）</Select.Option>
-                </Select>
-              </Tooltip>
-            </Flex>
-          )}
           <Form
             ref={formRef}
             labelCol={{ span: 4 }}
-            wrapperCol={{ span: 14 }}
+            wrapperCol={{ span: 20 }}
             layout="horizontal"
             size="small"
             style={{ maxWidth: 800 }}
             initialValues={formValue}
             onValuesChange={handleFormChange}
           >
+            <Form.Item label="导出 EXIF">
+              <Tooltip placement="topLeft" title="实验性功能：嵌入原图 EXIF 信息至导出图片，只支持 JPEG">
+                <Switch
+                  defaultChecked={exifEnable}
+                  onClick={() => setExifEnable(!exifEnable)}
+                />
+              </Tooltip>
+            </Form.Item>
+            {appleHdr && (
+              <Form.Item label="HDR 格式">
+                <Tooltip placement="topLeft" title="Ultra HDR JPEG：体积小（约 PNG 的 1/20），Apple 相册/Android/Chrome 通用；PQ PNG：16bit 高保真，体积大">
+                  <Select value={hdrFormat} style={{ width: '100%' }} onChange={value => setHdrFormat(value)}>
+                    <Select.Option value="ultrahdr">Ultra HDR JPEG（推荐）</Select.Option>
+                    <Select.Option value="png">PQ PNG（16bit）</Select.Option>
+                  </Select>
+                </Tooltip>
+              </Form.Item>
+            )}
             <Form.Item label="横幅大小" name="scale">
               <Slider
                 min={0.5}
@@ -227,7 +225,7 @@ function App() {
               <Input />
             </Form.Item>
             <Form.Item label="相机品牌" name="brand">
-              <Select style={{ width: 170 }}>
+              <Select style={{ width: '100%' }}>
                 {BrandsList.map(brand => (
                   <Select.Option key={brand} value={brand.toLowerCase()}>
                     {brand}
@@ -245,21 +243,21 @@ function App() {
               <Input />
             </Form.Item>
             <Form.Item label="字体大小" name="fontSize">
-              <Select style={{ width: 170 }} onChange={handleFontSizeChange}>
+              <Select style={{ width: '100%' }} onChange={handleFontSizeChange}>
                 <Select.Option value="small">小</Select.Option>
                 <Select.Option value="normal">正常</Select.Option>
                 <Select.Option value="large">大</Select.Option>
               </Select>
             </Form.Item>
             <Form.Item label="字体粗细" name="fontWeight">
-              <Select style={{ width: 170 }} onChange={handleFontWeightChange}>
+              <Select style={{ width: '100%' }} onChange={handleFontWeightChange}>
                 <Select.Option value="normal">正常</Select.Option>
                 <Select.Option value="bold">加粗</Select.Option>
                 <Select.Option value="black">黑体</Select.Option>
               </Select>
             </Form.Item>
             <Form.Item label="字体" name="fontFamily">
-              <Select style={{ width: 170 }} onChange={handleFontFamilyChange}>
+              <Select style={{ width: '100%' }} onChange={handleFontFamilyChange}>
                 <Select.Option value="default">Default</Select.Option>
                 <Select.Option value="misans">MiSans</Select.Option>
                 <Select.Option value="caveat">Caveat</Select.Option>
