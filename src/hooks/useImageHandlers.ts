@@ -237,13 +237,14 @@ export function useImageHandlers(formRef: any, initialFormValue: ExifParamsForm)
 
   const handleFontFamilyChange = (fontFamily) => {
     const familyMap = {
-      default: 'var(--font-family-default)',
-      caveat: 'var(--font-family-caveat)',
-      misans: 'var(--font-family-misans)',
-      helvetica: 'var(--font-family-helvetica)',
-      futura: 'var(--font-family-futura)',
-      avenir: 'var(--font-family-avenir)',
-      didot: 'var(--font-family-didot)',
+      'default': 'var(--font-family-default)',
+      'caveat': 'var(--font-family-caveat)',
+      'misans': 'var(--font-family-misans)',
+      'google-sans-flex': 'var(--font-family-google-sans-flex)',
+      'helvetica': 'var(--font-family-helvetica)',
+      'futura': 'var(--font-family-futura)',
+      'avenir': 'var(--font-family-avenir)',
+      'didot': 'var(--font-family-didot)',
     }
     document.documentElement.style.setProperty('--current-font-family', familyMap[fontFamily])
     setFormValue(prev => ({ ...prev, fontFamily }))

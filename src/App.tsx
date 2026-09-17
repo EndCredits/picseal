@@ -260,6 +260,7 @@ function App() {
               <Select style={{ width: '100%' }} onChange={handleFontFamilyChange}>
                 <Select.Option value="default">Default</Select.Option>
                 <Select.Option value="misans">MiSans</Select.Option>
+                <Select.Option value="google-sans-flex">Google Sans Flex</Select.Option>
                 <Select.Option value="caveat">Caveat</Select.Option>
                 <Select.Option value="helvetica">Helvetica Neue</Select.Option>
                 <Select.Option value="futura">Futura</Select.Option>

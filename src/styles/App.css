@@ -1,5 +1,5 @@
-/* 导入 Google Fonts */
-@import url('https://fonts.googleapis.com/css2?family=Caveat&family=Noto+Sans+Mono&family=Noto+Serif&display=swap');
+/* 导入 Google Fonts（Google Sans Flex 为可变字体：opsz 6..144 / wght 1..1000） */
+@import url('https://fonts.googleapis.com/css2?family=Caveat&family=Google+Sans+Flex:opsz,wght@6..144,1..1000&family=Noto+Sans+Mono&family=Noto+Serif&display=swap');
 
 /* 导入 MiSans 字体 */
 @import url('https://cdn.jsdelivr.net/npm/misans@4.0.0/lib/Normal/MiSans-Medium.min.css');
@@ -22,6 +22,7 @@
     --current-font-weight: var(--font-weight-bold);
     --font-family-default: system-ui, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial;
     --font-family-misans: "MiSans", var(--font-family-default); /* 添加 MiSans 字体 */
+    --font-family-google-sans-flex: "Google Sans Flex", var(--font-family-default);
     --font-family-caveat: 'Caveat', cursive;
     --font-family-helvetica: "Helvetica Neue", Helvetica, Arial, sans-serif;
     --font-family-futura: Futura, "Trebuchet MS", Arial, sans-serif;
